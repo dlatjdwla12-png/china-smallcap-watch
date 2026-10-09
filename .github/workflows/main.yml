@@ -182,17 +182,17 @@ jobs:
 
           lines = [
 
-              "China Smallcap Watch - preliminary scan",
+    "중국계 미국 소형주 조기 감지 - 예비 스캔",
 
-              f"Scan time: {now}",
+    f"스캔 시각(UTC): {now}",
 
-              "Source: Yahoo Finance screener; quotes may be delayed.",
+    "데이터 출처: Yahoo Finance 스크리너 (시세 지연 가능)",
 
-              "Volume ratio compares current session volume with 3-month average daily volume.",
+    "거래량 배수는 현재 거래량과 최근 3개월 평균 일일 거래량을 비교한 값입니다.",
 
-              "China links and dilution risks are NOT verified by this scan.",
+    "주의: 중국 관련성 및 주식 희석 위험은 이 스캔에서 검증되지 않았습니다.",
 
-              ""
+    ""
 
           ]
 
@@ -200,11 +200,11 @@ jobs:
 
               tag = (
 
-                  "NAME KEYWORD ONLY - verify China link"
+                  이름 키워드만 일치 - 중국 관련성 추가 확인 필요
 
                   if c["name_match"]
 
-                  else "CHINA LINK UNVERIFIED - research lead"
+                  else "중국 관련성 미확인 - 추가 조사 필요"
 
               )
 
@@ -212,13 +212,13 @@ jobs:
 
                   f'{c["symbol"]} | {c["name"]}\n'
 
-                  f'Price: ${c["price"]:.2f} | '
+                  f'주가: ${c["price"]:.2f} | '
 
-                  f'Volume: {c["volume"]:,} | '
+                  f'현재 거래량: {c["volume"]:,} | '
 
-                  f'3M avg: {c["avg"]:,} | '
+                  f'3개월 평균 거래량: {c["avg"]:,} | '
 
-                  f'Volume/avg: {c["ratio"]:.1f}x\n'
+                  f'평균 대비 거래량: {c["ratio"]:.1f}x\n'
 
                   f'{tag}\n'
 
@@ -228,9 +228,9 @@ jobs:
 
               lines.append(
 
-                  "No candidates met the initial price, volume and "
+                  초기 주가 및 거래량 필터를 통과한 후보가 없습니다."
 
-                  "volume-ratio filters in the returned screener results."
+                  반환된 스크리너 결과에서 거래량 배수 필터를 통과한 종목이 없습니다."
 
               )
 
