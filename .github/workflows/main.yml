@@ -2,15 +2,21 @@ name: China Smallcap Watch
 
 on:
 
-  workflow_dispatch:
-
   schedule:
 
     - cron: "7,22,37,52 * * * *"
 
+  workflow_dispatch:
+
 permissions:
 
   contents: read
+
+concurrency:
+
+  group: china-smallcap-watch
+
+  cancel-in-progress: false
 
 jobs:
 
@@ -18,9 +24,13 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    timeout-minutes: 5
+    timeout-minutes: 8
 
     steps:
+
+      - name: Checkout
+
+        uses: actions/checkout@v4
 
       - name: Set up Python
 
@@ -30,7 +40,11 @@ jobs:
 
           python-version: "3.12"
 
-      - name: Scan market and SEC filings
+      - name: Install dependencies
+
+        run: python -m pip install --disable-pip-version-check requests
+
+      - name: Scan candidates and notify
 
         env:
 
@@ -38,7 +52,7 @@ jobs:
 
         run: |
 
-          python - <<'PY'
+          cat > scan.py <<'PY'
 
           import os
 
@@ -48,670 +62,596 @@ jobs:
 
           import time
 
-          import urllib.request
-
-          import urllib.parse
+          import requests
 
           from datetime import datetime, timezone
 
+          SESSION = requests.Session()
+
+          SESSION.headers.update({
+
+              "User-Agent": "Mozilla/5.0 ChinaSmallcapWatch/1.0",
+
+              "Accept": "application/json,text/plain,*/*"
+
+          })
+
           TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 
-          if not TOPIC:
+          PRICE_MAX = 20.0
 
-              raise SystemExit("NTFY_TOPIC secret is missing")
+          VOLUME_MIN = 100_000
 
-          EMAIL = "jeoob1226@naver.com"
+          VOLUME_MULTIPLE_MIN = 2.0
 
-          YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0"}
+          MAX_ALERTS = 15
 
-          SEC_HEADERS = {
+          def get_json(url, timeout=12):
 
-              "User-Agent": f"ChinaSmallcapWatch/1.0 (contact: {EMAIL})",
+              try:
 
-              "Accept-Encoding": "gzip, deflate",
+                  r = SESSION.get(url, timeout=timeout)
 
-          }
+                  r.raise_for_status()
 
-          GITHUB_HEADERS = {
+                  return r.json()
 
-              "User-Agent": "ChinaSmallcapWatch/1.0",
+              except Exception as e:
 
-              "Accept": "application/vnd.github+json",
+                  print(f"Data request failed: {url} | {e}")
 
-          }
+                  return None
 
-          def get_json(url, headers, timeout=20):
-
-              req = urllib.request.Request(url, headers=headers)
-
-              with urllib.request.urlopen(req, timeout=timeout) as response:
-
-                  return json.loads(response.read().decode("utf-8"))
-
-          def get_text(url, headers, limit=1800000):
-
-              req = urllib.request.Request(url, headers=headers)
-
-              with urllib.request.urlopen(req, timeout=20) as response:
-
-                  return response.read(limit).decode("utf-8", errors="ignore")
-
-          # 1. Yahoo Finance market scan
-
-          found = {}
-
-          for screener in ["small_cap_gainers", "most_actives"]:
-
-              params = urllib.parse.urlencode({
-
-                  "scrIds": screener,
-
-                  "count": 250,
-
-                  "start": 0,
-
-                  "formatted": "false"
-
-              })
+          def yahoo_screen(screen_name):
 
               url = (
 
                   "https://query1.finance.yahoo.com/v1/finance/"
 
-                  "screener/predefined/saved?" + params
+                  "screener/predefined/saved"
 
               )
 
+              params = {
+
+                  "formatted": "false",
+
+                  "lang": "en-US",
+
+                  "region": "US",
+
+                  "scrIds": screen_name,
+
+                  "count": 250,
+
+                  "start": 0
+
+              }
+
               try:
 
-                  data = get_json(url, YAHOO_HEADERS)
+                  r = SESSION.get(url, params=params, timeout=15)
 
-                  results = data.get("finance", {}).get("result") or []
+                  r.raise_for_status()
 
-                  for quote in results[0].get("quotes", []) if results else []:
+                  data = r.json()
 
-                      symbol = quote.get("symbol")
+                  results = data.get("finance", {}).get("result", [])
 
-                      if symbol:
+                  if not results:
 
-                          found[symbol] = quote
+                      return []
+
+                  return results[0].get("quotes", []) or []
 
               except Exception as e:
 
-                  print(f"Yahoo {screener} unavailable: {e}")
+                  print(f"Yahoo screener failed ({screen_name}): {e}")
 
-          if not found:
+                  return []
 
-              raise SystemExit("No Yahoo market data received")
+          def num(value, default=0):
 
-          candidates = []
+              try:
 
-          for symbol, quote in found.items():
+                  return float(value) if value is not None else default
 
-              price = quote.get("regularMarketPrice")
+              except (ValueError, TypeError):
 
-              volume = quote.get("regularMarketVolume")
+                  return default
 
-              avg = quote.get("averageDailyVolume3Month")
+          def collect_candidates():
 
-              name = quote.get("longName") or quote.get("shortName") or symbol
+              merged = {}
 
-              if not all(isinstance(v, (int, float)) for v in [price, volume, avg]):
+              for screen in ("small_cap_gainers", "most_actives"):
 
-                  continue
+                  for q in yahoo_screen(screen):
 
-              if price <= 0 or avg <= 0:
+                      ticker = str(q.get("symbol", "")).upper().strip()
 
-                  continue
+                      if not ticker or not re.fullmatch(
 
-              if price > 20 or volume < 100000:
+                          r"[A-Z][A-Z0-9.\-]{0,9}", ticker
 
-                  continue
+                      ):
 
-              ratio = volume / avg
+                          continue
 
-              if ratio < 2:
+                      price = num(
 
-                  continue
+                          q.get("regularMarketPrice")
 
-              candidates.append({
+                          or q.get("regularMarketPreviousClose")
 
-                  "symbol": symbol,
+                      )
 
-                  "name": name,
+                      volume = num(q.get("regularMarketVolume"))
 
-                  "price": price,
+                      avg_volume = num(
 
-                  "volume": volume,
+                          q.get("averageDailyVolume3Month")
 
-                  "avg": avg,
+                          or q.get("averageDailyVolume10Day")
 
-                  "ratio": ratio
+                      )
 
-              })
+                      if price <= 0 or price > PRICE_MAX:
 
-          candidates.sort(
+                          continue
 
-              key=lambda item: (item["ratio"], item["volume"]),
+                      if volume < VOLUME_MIN:
 
-              reverse=True
+                          continue
 
-          )
+                      multiple = volume / avg_volume if avg_volume > 0 else 0
 
-          candidates = candidates[:10]
+                      if multiple < VOLUME_MULTIPLE_MIN:
 
-          # 2. Get ticker-to-CIK mapping:
+                          continue
 
-          #    try official SEC first, then public GitHub mirror.
+                      item = merged.setdefault(ticker, {
 
-          sec_map = {}
+                          "ticker": ticker,
 
-          mapping_source = "none"
+                          "name": q.get("shortName")
 
-          mapping_errors = []
+                                  or q.get("longName")
 
-          try:
+                                  or ticker,
 
-              mapping = get_json(
+                          "price": price,
+
+                          "volume": int(volume),
+
+                          "avg_volume": int(avg_volume),
+
+                          "multiple": multiple,
+
+                          "change": num(q.get("regularMarketChangePercent")),
+
+                          "market_cap": num(q.get("marketCap")),
+
+                          "screens": set()
+
+                      })
+
+                      item["screens"].add(screen)
+
+                      if multiple > item["multiple"]:
+
+                          item["multiple"] = multiple
+
+                          item["volume"] = int(volume)
+
+                          item["avg_volume"] = int(avg_volume)
+
+              return sorted(
+
+                  merged.values(),
+
+                  key=lambda x: x["multiple"],
+
+                  reverse=True
+
+              )
+
+          def load_ticker_ciks():
+
+              sources = [
 
                   "https://www.sec.gov/files/company_tickers.json",
 
-                  SEC_HEADERS
+                  "https://raw.githubusercontent.com/jadchaar/sec-cik-mapper/main/mappings/stocks/ticker_to_cik.json"
 
-              )
+              ]
 
-              for item in mapping.values():
+              for url in sources:
 
-                  ticker = str(item.get("ticker", "")).upper()
+                  try:
 
-                  cik = item.get("cik_str")
+                      r = SESSION.get(url, timeout=15)
 
-                  if ticker and cik:
+                      r.raise_for_status()
 
-                      sec_map[ticker] = str(cik).zfill(10)
+                      data = r.json()
 
-              if sec_map:
+                      mapping = {}
 
-                  mapping_source = "SEC official"
+                      if isinstance(data, dict):
 
-          except Exception as e:
+                          for value in data.values():
 
-              mapping_errors.append(f"SEC official mapping: {e}")
+                              if isinstance(value, dict):
 
-              print("Official SEC mapping unavailable:", e)
+                                  ticker = str(
 
-          if not sec_map:
+                                      value.get("ticker", "")
 
-              mirror_url = (
+                                  ).upper()
 
-                  "https://raw.githubusercontent.com/"
+                                  cik = value.get("cik_str")
 
-                  "jadchaar/sec-cik-mapper/main/"
+                                  if ticker and cik:
 
-                  "mappings/stocks/ticker_to_cik.json"
+                                      mapping[ticker] = str(cik).zfill(10)
 
-              )
+                          if not mapping:
 
-              try:
+                              for ticker, cik in data.items():
 
-                  mirror = get_json(mirror_url, GITHUB_HEADERS)
+                                  if isinstance(cik, (int, str)):
 
-                  if isinstance(mirror, dict):
+                                      mapping[str(ticker).upper()] = str(cik).zfill(10)
 
-                      for ticker, value in mirror.items():
+                      if mapping:
 
-                          cik = None
+                          print(f"Ticker-CIK mapping loaded: {len(mapping)}")
 
-                          if isinstance(value, (str, int)):
+                          print(f"Mapping source: {url}")
 
-                              cik = value
+                          return mapping
 
-                          elif isinstance(value, dict):
+                  except Exception as e:
 
-                              cik = value.get("cik") or value.get("cik_str")
+                      print(f"Ticker mapping unavailable: {e}")
 
-                          if cik is not None:
+              return {}
 
-                              ticker = str(ticker).upper().strip()
+          CHINA_TERMS = [
 
-                              cik_text = str(cik).strip()
+              "china", "chinese", "hong kong", "beijing", "shanghai",
 
-                              if ticker and cik_text.isdigit():
+              "shenzhen", "guangzhou", "prc", "people's republic of china",
 
-                                  sec_map[ticker] = cik_text.zfill(10)
-
-                  if sec_map:
-
-                      mapping_source = "GitHub public mirror"
-
-                  else:
-
-                      mapping_errors.append("GitHub mirror returned no usable mappings")
-
-              except Exception as e:
-
-                  mapping_errors.append(f"GitHub mapping mirror: {e}")
-
-                  print("GitHub mapping mirror unavailable:", e)
-
-          print(f"Ticker mapping source: {mapping_source}")
-
-          print(f"Ticker mappings loaded: {len(sec_map)}")
-
-          # 3. SEC filings checks are separate from mapping success.
-
-          china_terms = [
-
-              "people's republic of china",
-
-              "mainland china",
-
-              "china-based",
-
-              "china operations",
-
-              "operations in china",
-
-              "subsidiaries in china",
-
-              "manufacturing in china",
-
-              "facilities in china",
-
-              "employees in china",
-
-              "hong kong",
-
-              "prc subsidiary",
-
-              "china revenue",
-
-              "located in china",
-
-              "headquartered in china",
+              "variable interest entity", "v.i.e."
 
           ]
 
-          business_terms = [
+          DILUTION_TERMS = [
 
-              "operations", "operates", "manufacturing", "facility",
+              "at-the-market", "at the market offering", "equity distribution",
 
-              "facilities", "subsidiary", "subsidiaries", "employees",
+              "sales agreement", "shelf registration", "registered direct offering",
 
-              "revenue", "headquarters", "production", "business activities"
+              "public offering", "private placement", "convertible note",
 
-          ]
+              "convertible debenture", "warrant", "exercise price",
 
-          dilution_terms = [
+              "reverse stock split", "dilutive", "dilution",
 
-              "at-the-market offering",
+              "securities purchase agreement", "424b5", "s-1", "s-3",
 
-              "at the market offering",
-
-              "equity line of credit",
-
-              "registered direct offering",
-
-              "convertible notes",
-
-              "convertible securities",
-
-              "warrants outstanding",
-
-              "warrant exercise",
-
-              "shares of common stock offered",
-
-              "sales agreement",
-
-              "shelf registration",
-
-              "securities purchase agreement",
-
-              "private placement",
+              "prospectus supplement", "equity line of credit"
 
           ]
 
-          offering_forms = {
-
-              "S-1", "S-3", "S-1/A", "S-3/A",
-
-              "424B3", "424B5", "424B4"
-
-          }
-
-          def clean_html(text):
-
-              text = re.sub(
-
-                  r"(?is)<(script|style).*?>.*?</\\1>", " ", text
-
-              )
-
-              text = re.sub(r"(?s)<[^>]+>", " ", text)
-
-              text = re.sub(r"&nbsp;|&#160;", " ", text)
-
-              text = re.sub(r"&amp;", "&", text)
-
-              text = re.sub(r"&#\\d+;|&[a-zA-Z]+;", " ", text)
-
-              return re.sub(r"\\s+", " ", text)
-
-          def inspect_sec(symbol):
+          def sec_check(ticker, mapping):
 
               result = {
-
-                  "mapping": "없음",
-
-                  "filings": "조회 실패",
 
                   "china": "확인 불가",
 
                   "dilution": "확인 불가",
 
-                  "filing": None,
-
                   "source": None,
+
+                  "status": "공시 조회 실패"
 
               }
 
-              cik = sec_map.get(symbol.upper())
+              cik = mapping.get(ticker)
 
               if not cik:
 
-                  result["mapping"] = "티커-CIK 매핑 없음"
+                  result["status"] = "CIK 매핑 없음"
 
                   return result
 
-              result["mapping"] = "CIK 연결 성공"
+              # SEC submissions may return 403 in hosted runners.
 
-              submissions_url = (
-
-                  f"https://data.sec.gov/submissions/CIK{cik}.json"
-
-              )
+              url = f"https://data.sec.gov/submissions/CIK{cik}.json"
 
               try:
 
-                  time.sleep(0.25)
+                  r = SESSION.get(
 
-                  submissions = get_json(submissions_url, SEC_HEADERS)
+                      url,
 
-                  recent = submissions.get("filings", {}).get("recent", {})
+                      headers={
 
-                  forms = recent.get("form", [])
+                          "User-Agent": "Research contact research@example.com",
 
-                  accessions = recent.get("accessionNumber", [])
+                          "Accept-Encoding": "gzip, deflate",
 
-                  documents = recent.get("primaryDocument", [])
+                          "Host": "data.sec.gov"
 
-                  dates = recent.get("filingDate", [])
+                      },
 
-                  records = []
+                      timeout=12
 
-                  for i, form in enumerate(forms):
+                  )
 
-                      if i >= len(accessions) or i >= len(documents):
+                  if r.status_code == 403:
 
-                          continue
-
-                      records.append({
-
-                          "form": form,
-
-                          "accession": accessions[i],
-
-                          "document": documents[i],
-
-                          "date": dates[i] if i < len(dates) else ""
-
-                      })
-
-                  annual = [
-
-                      row for row in records
-
-                      if row["form"] in {"10-K", "20-F", "40-F"}
-
-                  ]
-
-                  offering = [
-
-                      row for row in records
-
-                      if row["form"] in offering_forms
-
-                  ]
-
-                  to_check = []
-
-                  if annual:
-
-                      to_check.append(annual[0])
-
-                  if offering and offering[0] not in to_check:
-
-                      to_check.append(offering[0])
-
-                  result["filings"] = "제출 목록 조회 성공"
-
-                  if not to_check:
-
-                      result["china"] = "검토할 연차/발행 공시 없음"
-
-                      result["dilution"] = "관련 공시 추가 확인 필요"
+                      result["status"] = "SEC 403 접근 차단"
 
                       return result
 
-                  china_found = False
+                  r.raise_for_status()
 
-                  dilution_found = False
+                  data = r.json()
 
-                  documents_read = 0
+                  recent = data.get("filings", {}).get("recent", {})
 
-                  document_errors = []
+                  forms = recent.get("form", [])
 
-                  for filing in to_check[:2]:
+                  dates = recent.get("filingDate", [])
 
-                      accession_path = filing["accession"].replace("-", "")
+                  docs = recent.get("primaryDocument", [])
 
-                      document = urllib.parse.quote(filing["document"])
+                  accessions = recent.get("accessionNumber", [])
 
-                      document_url = (
+                  company = data.get("name", ticker)
 
-                          "https://www.sec.gov/Archives/edgar/data/"
+                  china_hits = set()
 
-                          f"{int(cik)}/{accession_path}/{document}"
+                  dilution_hits = set()
+
+                  checked = 0
+
+                  for i, form in enumerate(forms):
+
+                      if i >= len(dates) or i >= len(docs) or i >= len(accessions):
+
+                          continue
+
+                      if form not in {
+
+                          "10-K", "10-Q", "8-K", "S-1", "S-3",
+
+                          "424B3", "424B5", "6-K", "20-F", "F-1", "F-3"
+
+                      }:
+
+                          continue
+
+                      accession = accessions[i].replace("-", "")
+
+                      document = docs[i]
+
+                      filing_url = (
+
+                          f"https://www.sec.gov/Archives/edgar/data/"
+
+                          f"{int(cik)}/{accession}/{document}"
 
                       )
 
                       try:
 
-                          time.sleep(0.25)
+                          fr = SESSION.get(filing_url, timeout=10)
 
-                          raw = get_text(document_url, SEC_HEADERS)
+                          if fr.status_code != 200:
 
-                          body = clean_html(raw).lower()
+                              continue
 
-                          documents_read += 1
+                          body = re.sub(
 
-                          if not result["filing"]:
+                              r"<script\b[^>]*>.*?</script>",
 
-                              result["filing"] = (
+                              " ", fr.text, flags=re.I | re.S
 
-                                  filing["form"] + " / " + filing["date"]
+                          )
 
-                              )
+                          body = re.sub(r"<[^>]+>", " ", body)
 
-                              result["source"] = document_url
+                          body = re.sub(r"\s+", " ", body).lower()
 
-                          if (
+                          checked += 1
 
-                              any(term in body for term in china_terms)
+                          for term in CHINA_TERMS:
 
-                              and any(term in body for term in business_terms)
+                              if term in body:
 
-                          ):
+                                  china_hits.add(term)
 
-                              china_found = True
+                          for term in DILUTION_TERMS:
 
-                          if filing["form"] in offering_forms:
+                              if term in body:
 
-                              dilution_found = True
+                                  dilution_hits.add(term)
 
-                          if any(term in body for term in dilution_terms):
+                          if checked >= 3:
 
-                              dilution_found = True
+                              break
 
-                      except Exception as e:
+                          time.sleep(0.15)
 
-                          document_errors.append(str(e))
+                      except Exception:
 
-                          print(f"SEC document unavailable for {symbol}: {e}")
+                          continue
 
-                  if documents_read:
+                  if checked:
+
+                      result["status"] = f"공시 {checked}건 확인"
+
+                      result["source"] = (
+
+                          f"https://www.sec.gov/edgar/search/"
+
+                          f"#/entityName={cik}"
+
+                      )
 
                       result["china"] = (
 
-                          "중국 관련 사업 단서 발견 - 문맥 확인 필요"
+                          "중국 관련 키워드 발견: "
 
-                          if china_found else "조회 공시에서 단서 미발견"
+                          + ", ".join(sorted(china_hits)[:5])
+
+                          if china_hits else
+
+                          "최근 확인 공시에서 관련 키워드 미발견"
 
                       )
 
                       result["dilution"] = (
 
-                          "희석 관련 키워드 발견 - 추가 검토 필요"
+                          "희석 관련 키워드 발견: "
 
-                          if dilution_found
+                          + ", ".join(sorted(dilution_hits)[:6])
 
-                          else "조회 공시에서 주요 키워드 미발견"
+                          if dilution_hits else
+
+                          "최근 확인 공시에서 관련 키워드 미발견"
 
                       )
 
                   else:
 
-                      result["filings"] = "제출 목록은 조회했으나 공시 본문 접근 실패"
+                      result["status"] = "공시 본문 확인 실패"
 
               except Exception as e:
 
-                  result["filings"] = f"SEC 제출 목록 조회 실패: {type(e).__name__}"
+                  print(f"SEC check failed for {ticker}: {e}")
 
-                  print(f"SEC submissions unavailable for {symbol}: {e}")
+                  result["status"] = "SEC 조회 오류"
 
               return result
 
-          for candidate in candidates:
+          def send_ntfy(message):
 
-              candidate["sec"] = inspect_sec(candidate["symbol"])
+              if not TOPIC:
 
-          # 4. Alert construction
+                  print("NTFY_TOPIC secret is missing; notification skipped.")
 
-          now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                  return False
 
-          lines = [
+              try:
 
-              "중국계 미국 소형주 조기 감지 - 예비 스캔",
+                  r = requests.post(
 
-              f"스캔 시각(UTC): {now}",
+                      f"https://ntfy.sh/{TOPIC}",
 
-              "시장 데이터: Yahoo Finance (지연 가능)",
+                      data=message.encode("utf-8"),
 
-              f"티커-CIK 매핑: {mapping_source}",
+                      headers={
 
-              "조건: 주가 $20 이하, 거래량 10만 주 이상, 평균 대비 2배 이상",
+                          "Title": "중국계 미국 소형주 조기 감시",
 
-              "장중 거래량은 누적 중이며 거래량 배수만으로 상승을 예측할 수 없습니다.",
+                          "Priority": "high",
 
-              "중국 단서와 희석 키워드는 확정 판정이 아니며 문맥 검토가 필요합니다.",
+                          "Tags": "chart_with_upwards_trend,mag"
 
-              ""
+                      },
 
-          ]
+                      timeout=15
 
-          for c in candidates:
+                  )
 
-              sec = c["sec"]
+                  print(f"ntfy response: {r.status_code}")
 
-              liquidity = (
+                  r.raise_for_status()
 
-                  "평균 거래량 낮음 주의"
+                  return True
 
-                  if c["avg"] < 50000
+              except Exception as e:
 
-                  else "평균 거래량 필터 통과"
+                  print(f"ntfy send failed: {e}")
 
-              )
+                  return False
 
-              lines.append(
+          def main():
 
-                  f'{c["symbol"]} | {c["name"]}\n'
+              now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-                  f'주가: ${c["price"]:.2f} | 거래량: {c["volume"]:,.0f} | '
+              print(f"Scan started: {now}")
 
-                  f'3개월 평균: {c["avg"]:,.0f} | 배수: {c["ratio"]:.1f}x\n'
+              candidates = collect_candidates()
 
-                  f'유동성: {liquidity}\n'
+              print(f"Market candidates: {len(candidates)}")
 
-                  f'티커-CIK: {sec["mapping"]}\n'
+              if not candidates:
 
-                  f'SEC 제출 목록: {sec["filings"]}\n'
+                  print("No candidates met market filters.")
 
-                  f'중국 관련성: {sec["china"]}\n'
+                  return
 
-                  f'희석 단서: {sec["dilution"]}\n'
+              mapping = load_ticker_ciks()
 
-                  f'공시: {sec["filing"] or "조회 자료 없음"}\n'
+              lines = [
 
-                  f'{sec["source"] or ""}\n'
+                  f"미국 소형주 거래량 급증 감시",
 
-              )
+                  f"스캔 시각: {now}",
 
-          if not candidates:
+                  f"조건: 주가 ${PRICE_MAX:g} 이하, 거래량 {VOLUME_MIN:,} 이상, 평균 대비 {VOLUME_MULTIPLE_MIN:g}배 이상",
 
-              lines.append("현재 조건을 통과한 후보가 없습니다.")
+                  "주의: 중국 관련성 및 희석 키워드는 투자 판단의 확정 증거가 아닙니다.",
 
-          if mapping_errors:
+                  ""
 
-              lines.append("매핑 조회 참고: " + " | ".join(mapping_errors[:2]))
+              ]
 
-          message = "\n".join(lines)
+              for item in candidates[:MAX_ALERTS]:
 
-          print(message)
+                  ticker = item["ticker"]
 
-          # Keep the existing notification behavior.
+                  sec = sec_check(ticker, mapping)
 
-          if candidates:
+                  change = item["change"]
 
-              request = urllib.request.Request(
+                  lines.extend([
 
-                  "https://ntfy.sh/" + urllib.parse.quote(TOPIC, safe=""),
+                      f"[{ticker}] {item['name']}",
 
-                  data=message.encode("utf-8"),
+                      f"현재가: ${item['price']:.2f} | 등락률: {change:+.1f}%",
 
-                  headers={
+                      f"거래량: {item['volume']:,} | 평균 대비: {item['multiple']:.1f}배",
 
-                      "Title": "China Smallcap Alert",
+                      f"중국 관련성: {sec['china']}",
 
-                      "Priority": "high",
+                      f"희석 위험 단서: {sec['dilution']}",
 
-                      "Tags": "chart_with_upwards_trend",
+                      f"공시 조회 상태: {sec['status']}",
 
-                      "Content-Type": "text/plain; charset=utf-8"
+                      f"공시 확인: {sec['source'] or 'https://www.sec.gov/edgar/search/'}",
 
-                  },
+                      f"Yahoo Finance: https://finance.yahoo.com/quote/{ticker}/",
 
-                  method="POST"
+                      ""
 
-              )
+                  ])
 
-              with urllib.request.urlopen(request, timeout=20) as response:
+                  time.sleep(0.15)
 
-                  print("ntfy response:", response.status)
+              send_ntfy("\n".join(lines))
 
-          else:
+          if __name__ == "__main__":
 
-              print("No candidates; no ntfy alert sent.")
+              main()
 
           PY
+
+          python scan.py
