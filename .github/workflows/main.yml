@@ -1,31 +1,57 @@
-
 name: China Smallcap Watch
 
 on:
+
   workflow_dispatch:
+
   schedule:
+
     - cron: "*/5 * * * *"
 
 permissions:
+
   contents: read
 
 jobs:
+
   scan:
+
     runs-on: ubuntu-latest
+
     steps:
+
       - name: Checkout repository
+
         uses: actions/checkout@v4
 
       - name: Check workflow setup
+
         run: |
+
           echo "China small-cap watch workflow started"
+
           date -u
-      - name: Verify ntfy secret exists
+
+      - name: Send ntfy test notification
+
         env:
+
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
         run: |
+
           if [ -z "$NTFY_TOPIC" ]; then
+
             echo "NTFY_TOPIC secret is missing"
+
             exit 1
+
           fi
-          echo "NTFY_TOPIC secret is configured"
+
+          curl -fsS \
+
+            -H "Title: China Smallcap Watch test" \
+
+            -d "GitHub Actions to ntfy connection test succeeded." \
+
+            "https://ntfy.sh/${NTFY_TOPIC}"
