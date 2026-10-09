@@ -18,6 +18,8 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    timeout-minutes: 3
+
     steps:
 
       - name: Set up Python
@@ -38,7 +40,13 @@ jobs:
 
           python - <<'PY'
 
-          import os, json, urllib.request, urllib.parse
+          import os
+
+          import json
+
+          import urllib.request
+
+          import urllib.parse
 
           from datetime import datetime, timezone
 
@@ -78,19 +86,33 @@ jobs:
 
               try:
 
-                  req = urllib.request.Request(url, headers=headers)
+                  req = urllib.request.Request(
 
-                  with urllib.request.urlopen(req, timeout=20) as response:
+                      url, headers=headers
 
-                      data = json.loads(response.read().decode("utf-8"))
+                  )
+
+                  with urllib.request.urlopen(
+
+                      req, timeout=20
+
+                  ) as response:
+
+                      data = json.loads(
+
+                          response.read().decode("utf-8")
+
+                      )
 
                   quotes = data["finance"]["result"][0]["quotes"]
 
                   for q in quotes:
 
-                      if q.get("symbol"):
+                      symbol = q.get("symbol")
 
-                          found[q["symbol"]] = q
+                      if symbol:
+
+                          found[symbol] = q
 
               except Exception as e:
 
@@ -100,17 +122,19 @@ jobs:
 
               raise SystemExit(
 
-                  "No market data received. No stock alert was generated."
+                  "No market data received. No alert generated."
 
               )
 
           china_words = [
 
-              "china", "chinese", "hong kong", "beijing", "shanghai",
+              "china", "chinese", "hong kong", "beijing",
 
-              "shenzhen", "nanjing", "hangzhou", "wuhan", "chengdu",
+              "shanghai", "shenzhen", "nanjing", "hangzhou",
 
-              "xiamen", "tianjin", "suzhou", "guangzhou", "macau"
+              "wuhan", "chengdu", "xiamen", "tianjin",
+
+              "suzhou", "guangzhou", "macau"
 
           ]
 
@@ -118,7 +142,15 @@ jobs:
 
           for symbol, q in found.items():
 
-              name = q.get("shortName") or q.get("longName") or symbol
+              name = (
+
+                  q.get("shortName")
+
+                  or q.get("longName")
+
+                  or symbol
+
+              )
 
               price = q.get("regularMarketPrice")
 
@@ -128,13 +160,21 @@ jobs:
 
               cap = q.get("marketCap")
 
-              if not all(isinstance(x, (int, float)) for x in
+              if not all(
 
-                         [price, volume, avg]) or avg <= 0:
+                  isinstance(x, (int, float))
+
+                  for x in [price, volume, avg]
+
+              ):
 
                   continue
 
-              if price <= 0 or price > 20 or volume < 100000:
+              if avg <= 0 or price <= 0:
+
+                  continue
+
+              if price > 20 or volume < 100000:
 
                   continue
 
@@ -144,11 +184,13 @@ jobs:
 
                   continue
 
-              # Name keywords are only a preliminary clue, not proof
+              name_match = any(
 
-              # of Chinese ownership or operations.
+                  word in name.lower()
 
-              name_match = any(w in name.lower() for w in china_words)
+                  for word in china_words
+
+              )
 
               candidates.append({
 
@@ -170,43 +212,67 @@ jobs:
 
               })
 
-          candidates.sort(key=lambda x: x["ratio"], reverse=True)
+          # Put possible China-name matches first,
 
-          # Prioritize name matches; keep other surges as leads
+          # then sort by volume ratio within each group.
 
-          candidates.sort(key=lambda x: x["name_match"], reverse=True)
+          candidates.sort(
+
+              key=lambda x: (
+
+                  x["name_match"],
+
+                  x["ratio"]
+
+              ),
+
+              reverse=True
+
+          )
 
           candidates = candidates[:10]
 
-          now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+          now = datetime.now(timezone.utc).strftime(
+
+              "%Y-%m-%d %H:%M UTC"
+
+          )
 
           lines = [
 
-    "중국계 미국 소형주 조기 감지 - 예비 스캔",
+              "중국계 미국 소형주 조기 감지 - 예비 스캔",
 
-    f"스캔 시각(UTC): {now}",
+              f"스캔 시각(UTC): {now}",
 
-    "데이터 출처: Yahoo Finance 스크리너 (시세 지연 가능)",
+              "데이터 출처: Yahoo Finance 스크리너 (시세 지연 가능)",
 
-    "거래량 배수는 현재 거래량과 최근 3개월 평균 일일 거래량을 비교한 값입니다.",
+              "거래량 배수 = 현재 거래량 / 3개월 평균 일일 거래량",
 
-    "주의: 중국 관련성 및 주식 희석 위험은 이 스캔에서 검증되지 않았습니다.",
+              "주의: 이름 키워드만으로 중국 관련성이 입증되지는 않습니다.",
 
-    ""
+              "희석 위험 및 실제 중국 사업 여부는 별도 확인이 필요합니다.",
+
+              ""
 
           ]
 
           for c in candidates:
 
-              tag = (
+              if c["name_match"]:
 
-                  이름 키워드만 일치 - 중국 관련성 추가 확인 필요
+                  tag = (
 
-                  if c["name_match"]
+                      "이름 키워드 일치 - 중국 관련성 추가 확인 필요"
 
-                  else "중국 관련성 미확인 - 추가 조사 필요"
+                  )
 
-              )
+              else:
+
+                  tag = (
+
+                      "중국 관련성 미확인 - 추가 조사 필요"
+
+                  )
 
               lines.append(
 
@@ -214,9 +280,9 @@ jobs:
 
                   f'주가: ${c["price"]:.2f} | '
 
-                  f'현재 거래량: {c["volume"]:,} | '
+                  f'현재 거래량: {c["volume"]:,.0f} | '
 
-                  f'3개월 평균 거래량: {c["avg"]:,} | '
+                  f'3개월 평균 거래량: {c["avg"]:,.0f} | '
 
                   f'평균 대비 거래량: {c["ratio"]:.1f}x\n'
 
@@ -228,9 +294,7 @@ jobs:
 
               lines.append(
 
-                  초기 주가 및 거래량 필터를 통과한 후보가 없습니다."
-
-                  반환된 스크리너 결과에서 거래량 배수 필터를 통과한 종목이 없습니다."
+                  "초기 주가 및 거래량 필터를 통과한 후보가 없습니다."
 
               )
 
@@ -238,13 +302,15 @@ jobs:
 
           print(message)
 
-          # Send only when candidates pass the initial filters
+          # Send a notification only when candidates are found.
 
           if candidates:
 
-              req = urllib.request.Request(
+              request = urllib.request.Request(
 
-                  f"https://ntfy.sh/{urllib.parse.quote(topic, safe='')}",
+                  "https://ntfy.sh/"
+
+                  + urllib.parse.quote(topic, safe=""),
 
                   data=message.encode("utf-8"),
 
@@ -264,7 +330,11 @@ jobs:
 
               )
 
-              with urllib.request.urlopen(req, timeout=20) as response:
+              with urllib.request.urlopen(
+
+                  request, timeout=20
+
+              ) as response:
 
                   print("ntfy response:", response.status)
 
