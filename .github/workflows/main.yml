@@ -66,39 +66,35 @@ jobs:
 
           SEC_HEADERS = {
 
-              "User-Agent": f"ChinaSmallcapWatch/1.0 {EMAIL}",
-
-              "Accept-Encoding": "gzip, deflate",
-
-              "Host": "www.sec.gov",
-
-          }
-
-          SEC_DATA_HEADERS = {
-
-              "User-Agent": f"ChinaSmallcapWatch/1.0 {EMAIL}",
+              "User-Agent": f"ChinaSmallcapWatch/1.0 (contact: {EMAIL})",
 
               "Accept-Encoding": "gzip, deflate",
 
           }
 
-          def get_json(url, headers, timeout=15):
+          GITHUB_HEADERS = {
+
+              "User-Agent": "ChinaSmallcapWatch/1.0",
+
+              "Accept": "application/vnd.github+json",
+
+          }
+
+          def get_json(url, headers, timeout=20):
 
               req = urllib.request.Request(url, headers=headers)
 
-              with urllib.request.urlopen(req, timeout=timeout) as r:
+              with urllib.request.urlopen(req, timeout=timeout) as response:
 
-                  return json.loads(r.read().decode("utf-8"))
+                  return json.loads(response.read().decode("utf-8"))
 
           def get_text(url, headers, limit=1800000):
 
               req = urllib.request.Request(url, headers=headers)
 
-              with urllib.request.urlopen(req, timeout=20) as r:
+              with urllib.request.urlopen(req, timeout=20) as response:
 
-                  raw = r.read(limit)
-
-              return raw.decode("utf-8", errors="ignore")
+                  return response.read(limit).decode("utf-8", errors="ignore")
 
           # 1. Yahoo Finance market scan
 
@@ -132,13 +128,13 @@ jobs:
 
                   results = data.get("finance", {}).get("result") or []
 
-                  for q in results[0].get("quotes", []) if results else []:
+                  for quote in results[0].get("quotes", []) if results else []:
 
-                      symbol = q.get("symbol")
+                      symbol = quote.get("symbol")
 
                       if symbol:
 
-                          found[symbol] = q
+                          found[symbol] = quote
 
               except Exception as e:
 
@@ -150,19 +146,17 @@ jobs:
 
           candidates = []
 
-          for symbol, q in found.items():
+          for symbol, quote in found.items():
 
-              price = q.get("regularMarketPrice")
+              price = quote.get("regularMarketPrice")
 
-              volume = q.get("regularMarketVolume")
+              volume = quote.get("regularMarketVolume")
 
-              avg = q.get("averageDailyVolume3Month")
+              avg = quote.get("averageDailyVolume3Month")
 
-              name = q.get("longName") or q.get("shortName") or symbol
+              name = quote.get("longName") or quote.get("shortName") or symbol
 
-              if not all(isinstance(x, (int, float))
-
-                         for x in [price, volume, avg]):
+              if not all(isinstance(v, (int, float)) for v in [price, volume, avg]):
 
                   continue
 
@@ -198,7 +192,7 @@ jobs:
 
           candidates.sort(
 
-              key=lambda x: (x["ratio"], x["volume"]),
+              key=lambda item: (item["ratio"], item["volume"]),
 
               reverse=True
 
@@ -206,11 +200,15 @@ jobs:
 
           candidates = candidates[:10]
 
-          # 2. SEC ticker mapping
+          # 2. Get ticker-to-CIK mapping:
+
+          #    try official SEC first, then public GitHub mirror.
 
           sec_map = {}
 
-          sec_map_error = None
+          mapping_source = "none"
+
+          mapping_errors = []
 
           try:
 
@@ -232,31 +230,75 @@ jobs:
 
                       sec_map[ticker] = str(cik).zfill(10)
 
-              print(f"SEC ticker mapping loaded: {len(sec_map)}")
+              if sec_map:
+
+                  mapping_source = "SEC official"
 
           except Exception as e:
 
-              sec_map_error = str(e)
+              mapping_errors.append(f"SEC official mapping: {e}")
 
-              print("SEC company mapping unavailable:", e)
+              print("Official SEC mapping unavailable:", e)
 
-          def clean_html(text):
+          if not sec_map:
 
-              text = re.sub(
+              mirror_url = (
 
-                  r"(?is)<(script|style).*?>.*?</\1>", " ", text
+                  "https://raw.githubusercontent.com/"
+
+                  "jadchaar/sec-cik-mapper/main/"
+
+                  "mappings/stocks/ticker_to_cik.json"
 
               )
 
-              text = re.sub(r"(?s)<[^>]+>", " ", text)
+              try:
 
-              text = re.sub(r"&nbsp;|&#160;", " ", text)
+                  mirror = get_json(mirror_url, GITHUB_HEADERS)
 
-              text = re.sub(r"&amp;", "&", text)
+                  if isinstance(mirror, dict):
 
-              text = re.sub(r"&#\d+;|&[a-zA-Z]+;", " ", text)
+                      for ticker, value in mirror.items():
 
-              return re.sub(r"\s+", " ", text)
+                          cik = None
+
+                          if isinstance(value, (str, int)):
+
+                              cik = value
+
+                          elif isinstance(value, dict):
+
+                              cik = value.get("cik") or value.get("cik_str")
+
+                          if cik is not None:
+
+                              ticker = str(ticker).upper().strip()
+
+                              cik_text = str(cik).strip()
+
+                              if ticker and cik_text.isdigit():
+
+                                  sec_map[ticker] = cik_text.zfill(10)
+
+                  if sec_map:
+
+                      mapping_source = "GitHub public mirror"
+
+                  else:
+
+                      mapping_errors.append("GitHub mirror returned no usable mappings")
+
+              except Exception as e:
+
+                  mapping_errors.append(f"GitHub mapping mirror: {e}")
+
+                  print("GitHub mapping mirror unavailable:", e)
+
+          print(f"Ticker mapping source: {mapping_source}")
+
+          print(f"Ticker mappings loaded: {len(sec_map)}")
+
+          # 3. SEC filings checks are separate from mapping success.
 
           china_terms = [
 
@@ -296,9 +338,7 @@ jobs:
 
               "facilities", "subsidiary", "subsidiaries", "employees",
 
-              "revenue", "headquarters", "principal office",
-
-              "production", "customers", "business activities",
+              "revenue", "headquarters", "production", "business activities"
 
           ]
 
@@ -340,9 +380,31 @@ jobs:
 
           }
 
+          def clean_html(text):
+
+              text = re.sub(
+
+                  r"(?is)<(script|style).*?>.*?</\\1>", " ", text
+
+              )
+
+              text = re.sub(r"(?s)<[^>]+>", " ", text)
+
+              text = re.sub(r"&nbsp;|&#160;", " ", text)
+
+              text = re.sub(r"&amp;", "&", text)
+
+              text = re.sub(r"&#\\d+;|&[a-zA-Z]+;", " ", text)
+
+              return re.sub(r"\\s+", " ", text)
+
           def inspect_sec(symbol):
 
               result = {
+
+                  "mapping": "없음",
+
+                  "filings": "조회 실패",
 
                   "china": "확인 불가",
 
@@ -352,29 +414,29 @@ jobs:
 
                   "source": None,
 
-                  "notes": []
-
               }
 
               cik = sec_map.get(symbol.upper())
 
               if not cik:
 
-                  result["notes"].append("SEC 티커 매칭 없음")
+                  result["mapping"] = "티커-CIK 매핑 없음"
 
                   return result
 
+              result["mapping"] = "CIK 연결 성공"
+
+              submissions_url = (
+
+                  f"https://data.sec.gov/submissions/CIK{cik}.json"
+
+              )
+
               try:
 
-                  time.sleep(0.2)
+                  time.sleep(0.25)
 
-                  submissions = get_json(
-
-                      f"https://data.sec.gov/submissions/CIK{cik}.json",
-
-                      SEC_DATA_HEADERS
-
-                  )
+                  submissions = get_json(submissions_url, SEC_HEADERS)
 
                   recent = submissions.get("filings", {}).get("recent", {})
 
@@ -408,17 +470,17 @@ jobs:
 
                   annual = [
 
-                      x for x in records
+                      row for row in records
 
-                      if x["form"] in {"10-K", "20-F", "40-F"}
+                      if row["form"] in {"10-K", "20-F", "40-F"}
 
                   ]
 
                   offering = [
 
-                      x for x in records
+                      row for row in records
 
-                      if x["form"] in offering_forms
+                      if row["form"] in offering_forms
 
                   ]
 
@@ -432,11 +494,13 @@ jobs:
 
                       to_check.append(offering[0])
 
+                  result["filings"] = "제출 목록 조회 성공"
+
                   if not to_check:
 
-                      result["notes"].append("최근 연차/발행 공시 없음")
+                      result["china"] = "검토할 연차/발행 공시 없음"
 
-                      result["dilution"] = "관련 공시 확인 필요"
+                      result["dilution"] = "관련 공시 추가 확인 필요"
 
                       return result
 
@@ -444,31 +508,33 @@ jobs:
 
                   dilution_found = False
 
-                  document_read = False
+                  documents_read = 0
+
+                  document_errors = []
 
                   for filing in to_check[:2]:
 
+                      accession_path = filing["accession"].replace("-", "")
+
+                      document = urllib.parse.quote(filing["document"])
+
+                      document_url = (
+
+                          "https://www.sec.gov/Archives/edgar/data/"
+
+                          f"{int(cik)}/{accession_path}/{document}"
+
+                      )
+
                       try:
 
-                          time.sleep(0.2)
+                          time.sleep(0.25)
 
-                          accession_path = filing["accession"].replace("-", "")
-
-                          doc = urllib.parse.quote(filing["document"])
-
-                          url = (
-
-                              "https://www.sec.gov/Archives/edgar/data/"
-
-                              f"{int(cik)}/{accession_path}/{doc}"
-
-                          )
-
-                          raw = get_text(url, SEC_HEADERS)
+                          raw = get_text(document_url, SEC_HEADERS)
 
                           body = clean_html(raw).lower()
 
-                          document_read = True
+                          documents_read += 1
 
                           if not result["filing"]:
 
@@ -478,13 +544,13 @@ jobs:
 
                               )
 
-                              result["source"] = url
+                              result["source"] = document_url
 
                           if (
 
-                              any(t in body for t in china_terms)
+                              any(term in body for term in china_terms)
 
-                              and any(t in body for t in business_terms)
+                              and any(term in body for term in business_terms)
 
                           ):
 
@@ -494,23 +560,23 @@ jobs:
 
                               dilution_found = True
 
-                          if any(t in body for t in dilution_terms):
+                          if any(term in body for term in dilution_terms):
 
                               dilution_found = True
 
                       except Exception as e:
 
-                          print(f"SEC filing error {symbol}: {e}")
+                          document_errors.append(str(e))
 
-                          result["notes"].append("공시 문서 조회 실패")
+                          print(f"SEC document unavailable for {symbol}: {e}")
 
-                  if document_read:
+                  if documents_read:
 
                       result["china"] = (
 
-                          "중국 관련 사업 단서 발견"
+                          "중국 관련 사업 단서 발견 - 문맥 확인 필요"
 
-                          if china_found else "공시에서 단서 미확인"
+                          if china_found else "조회 공시에서 단서 미발견"
 
                       )
 
@@ -520,25 +586,27 @@ jobs:
 
                           if dilution_found
 
-                          else "조회한 공시에서 주요 키워드 미발견"
+                          else "조회 공시에서 주요 키워드 미발견"
 
                       )
 
+                  else:
+
+                      result["filings"] = "제출 목록은 조회했으나 공시 본문 접근 실패"
+
               except Exception as e:
 
-                  print(f"SEC company lookup error {symbol}: {e}")
+                  result["filings"] = f"SEC 제출 목록 조회 실패: {type(e).__name__}"
 
-                  result["notes"].append("SEC 조회 실패")
+                  print(f"SEC submissions unavailable for {symbol}: {e}")
 
               return result
 
-          # 3. Check SEC for top candidates
+          for candidate in candidates:
 
-          for c in candidates:
+              candidate["sec"] = inspect_sec(candidate["symbol"])
 
-              c["sec"] = inspect_sec(c["symbol"])
-
-          # 4. Build alert
+          # 4. Alert construction
 
           now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -548,15 +616,15 @@ jobs:
 
               f"스캔 시각(UTC): {now}",
 
-              "데이터: Yahoo Finance / SEC EDGAR",
+              "시장 데이터: Yahoo Finance (지연 가능)",
+
+              f"티커-CIK 매핑: {mapping_source}",
 
               "조건: 주가 $20 이하, 거래량 10만 주 이상, 평균 대비 2배 이상",
 
-              "주의: 장중 거래량은 누적 중이며 시세 지연·누락이 있을 수 있습니다.",
+              "장중 거래량은 누적 중이며 거래량 배수만으로 상승을 예측할 수 없습니다.",
 
-              "중국 관련 단서는 확정 판정이 아닙니다.",
-
-              "희석 키워드는 실제 발행 가능 물량이나 잔여 ATM 한도를 뜻하지 않습니다.",
+              "중국 단서와 희석 키워드는 확정 판정이 아니며 문맥 검토가 필요합니다.",
 
               ""
 
@@ -586,11 +654,15 @@ jobs:
 
                   f'유동성: {liquidity}\n'
 
+                  f'티커-CIK: {sec["mapping"]}\n'
+
+                  f'SEC 제출 목록: {sec["filings"]}\n'
+
                   f'중국 관련성: {sec["china"]}\n'
 
-                  f'희석 위험: {sec["dilution"]}\n'
+                  f'희석 단서: {sec["dilution"]}\n'
 
-                  f'SEC 공시: {sec["filing"] or "조회 자료 없음"}\n'
+                  f'공시: {sec["filing"] or "조회 자료 없음"}\n'
 
                   f'{sec["source"] or ""}\n'
 
@@ -600,23 +672,19 @@ jobs:
 
               lines.append("현재 조건을 통과한 후보가 없습니다.")
 
-          if sec_map_error:
+          if mapping_errors:
 
-              lines.append(
-
-                  "SEC 기업 목록 조회 실패: 일부 검증을 수행하지 못했습니다."
-
-              )
+              lines.append("매핑 조회 참고: " + " | ".join(mapping_errors[:2]))
 
           message = "\n".join(lines)
 
           print(message)
 
-          # Preserve ntfy behavior: alert only when candidates exist.
+          # Keep the existing notification behavior.
 
           if candidates:
 
-              req = urllib.request.Request(
+              request = urllib.request.Request(
 
                   "https://ntfy.sh/" + urllib.parse.quote(TOPIC, safe=""),
 
@@ -638,7 +706,7 @@ jobs:
 
               )
 
-              with urllib.request.urlopen(req, timeout=20) as response:
+              with urllib.request.urlopen(request, timeout=20) as response:
 
                   print("ntfy response:", response.status)
 
