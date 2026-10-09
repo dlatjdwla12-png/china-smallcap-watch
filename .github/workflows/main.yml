@@ -316,7 +316,7 @@ jobs:
 
                   headers={
 
-                      "Title": "중국계 미국 소형주 조기감지",
+                      "Title": "China Smallcap Alert",
 
                       "Priority": "high",
 
