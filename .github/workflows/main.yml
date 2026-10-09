@@ -6,7 +6,7 @@ on:
 
   schedule:
 
-    - cron: "*/15 * * * *"
+    - cron: "7,22,37,52 * * * *"
 
 permissions:
 
@@ -18,7 +18,7 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    timeout-minutes: 3
+    timeout-minutes: 5
 
     steps:
 
@@ -30,7 +30,7 @@ jobs:
 
           python-version: "3.12"
 
-      - name: Scan free market data
+      - name: Scan market and SEC filings
 
         env:
 
@@ -42,7 +42,11 @@ jobs:
 
           import os
 
+          import re
+
           import json
+
+          import time
 
           import urllib.request
 
@@ -50,19 +54,45 @@ jobs:
 
           from datetime import datetime, timezone
 
-          topic = os.environ.get("NTFY_TOPIC", "").strip()
+          TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 
-          if not topic:
+          if not TOPIC:
 
               raise SystemExit("NTFY_TOPIC secret is missing")
 
-          headers = {"User-Agent": "Mozilla/5.0"}
+          YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-          screeners = ["small_cap_gainers", "most_actives"]
+          SEC_HEADERS = {
+
+              "User-Agent": "ChinaSmallcapWatch/1.0 (GitHub Actions; public research)",
+
+              "Accept-Encoding": "gzip, deflate",
+
+          }
+
+          def get_json(url, headers, timeout=15):
+
+              req = urllib.request.Request(url, headers=headers)
+
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+
+                  return json.loads(r.read().decode("utf-8"))
+
+          def get_text(url, headers, limit=1800000):
+
+              req = urllib.request.Request(url, headers=headers)
+
+              with urllib.request.urlopen(req, timeout=20) as r:
+
+                  raw = r.read(limit)
+
+              return raw.decode("utf-8", errors="ignore")
+
+          # 1. Collect candidates from Yahoo Finance.
 
           found = {}
 
-          for screener in screeners:
+          for screener in ["small_cap_gainers", "most_actives"]:
 
               params = urllib.parse.urlencode({
 
@@ -86,27 +116,11 @@ jobs:
 
               try:
 
-                  req = urllib.request.Request(
+                  data = get_json(url, YAHOO_HEADERS)
 
-                      url, headers=headers
+                  results = data.get("finance", {}).get("result") or []
 
-                  )
-
-                  with urllib.request.urlopen(
-
-                      req, timeout=20
-
-                  ) as response:
-
-                      data = json.loads(
-
-                          response.read().decode("utf-8")
-
-                      )
-
-                  quotes = data["finance"]["result"][0]["quotes"]
-
-                  for q in quotes:
+                  for q in results[0].get("quotes", []) if results else []:
 
                       symbol = q.get("symbol")
 
@@ -116,41 +130,15 @@ jobs:
 
               except Exception as e:
 
-                  print(f"{screener} data unavailable: {e}")
+                  print(f"Yahoo {screener} unavailable: {e}")
 
           if not found:
 
-              raise SystemExit(
-
-                  "No market data received. No alert generated."
-
-              )
-
-          china_words = [
-
-              "china", "chinese", "hong kong", "beijing",
-
-              "shanghai", "shenzhen", "nanjing", "hangzhou",
-
-              "wuhan", "chengdu", "xiamen", "tianjin",
-
-              "suzhou", "guangzhou", "macau"
-
-          ]
+              raise SystemExit("No Yahoo market data received")
 
           candidates = []
 
           for symbol, q in found.items():
-
-              name = (
-
-                  q.get("shortName")
-
-                  or q.get("longName")
-
-                  or symbol
-
-              )
 
               price = q.get("regularMarketPrice")
 
@@ -158,19 +146,17 @@ jobs:
 
               avg = q.get("averageDailyVolume3Month")
 
+              name = q.get("longName") or q.get("shortName") or symbol
+
               cap = q.get("marketCap")
 
-              if not all(
+              if not all(isinstance(x, (int, float)) for x in
 
-                  isinstance(x, (int, float))
-
-                  for x in [price, volume, avg]
-
-              ):
+                         [price, volume, avg]):
 
                   continue
 
-              if avg <= 0 or price <= 0:
+              if price <= 0 or avg <= 0:
 
                   continue
 
@@ -183,14 +169,6 @@ jobs:
               if ratio < 2:
 
                   continue
-
-              name_match = any(
-
-                  word in name.lower()
-
-                  for word in china_words
-
-              )
 
               candidates.append({
 
@@ -206,25 +184,13 @@ jobs:
 
                   "ratio": ratio,
 
-                  "cap": cap,
-
-                  "name_match": name_match
+                  "cap": cap
 
               })
 
-          # Put possible China-name matches first,
-
-          # then sort by volume ratio within each group.
-
           candidates.sort(
 
-              key=lambda x: (
-
-                  x["name_match"],
-
-                  x["ratio"]
-
-              ),
+              key=lambda x: (x["ratio"], x["volume"]),
 
               reverse=True
 
@@ -232,11 +198,369 @@ jobs:
 
           candidates = candidates[:10]
 
-          now = datetime.now(timezone.utc).strftime(
+          # 2. Load the SEC ticker-to-company mapping.
 
-              "%Y-%m-%d %H:%M UTC"
+          sec_map = {}
 
-          )
+          sec_map_error = None
+
+          try:
+
+              mapping = get_json(
+
+                  "https://www.sec.gov/files/company_tickers.json",
+
+                  SEC_HEADERS
+
+              )
+
+              for item in mapping.values():
+
+                  ticker = str(item.get("ticker", "")).upper()
+
+                  cik = item.get("cik_str")
+
+                  if ticker and cik:
+
+                      sec_map[ticker] = str(cik).zfill(10)
+
+          except Exception as e:
+
+              sec_map_error = str(e)
+
+              print("SEC company mapping unavailable:", e)
+
+          def clean_html(text):
+
+              text = re.sub(
+
+                  r"(?is)<(script|style).*?>.*?</\\1>", " ", text
+
+              )
+
+              text = re.sub(r"(?s)<[^>]+>", " ", text)
+
+              text = re.sub(r"&nbsp;|&#160;", " ", text)
+
+              text = re.sub(r"&amp;", "&", text)
+
+              text = re.sub(r"&#\d+;|&[a-zA-Z]+;", " ", text)
+
+              return re.sub(r"\\s+", " ", text)
+
+          def filing_url(cik, accession, document):
+
+              accession_no_dash = accession.replace("-", "")
+
+              return (
+
+                  f"https://www.sec.gov/Archives/edgar/data/"
+
+                  f"{int(cik)}/{accession_no_dash}/"
+
+                  f"{urllib.parse.quote(document)}"
+
+              )
+
+          china_terms = [
+
+              "people's republic of china",
+
+              "mainland china",
+
+              "china-based",
+
+              "china operations",
+
+              "operations in china",
+
+              "subsidiaries in china",
+
+              "manufacturing in china",
+
+              "facilities in china",
+
+              "employees in china",
+
+              "hong kong",
+
+              "prc subsidiary",
+
+              "china revenue",
+
+              "located in china",
+
+              "headquartered in china",
+
+          ]
+
+          business_terms = [
+
+              "operations", "operates", "manufacturing", "facility",
+
+              "facilities", "subsidiary", "subsidiaries", "employees",
+
+              "revenue", "headquarters", "principal office",
+
+              "production", "customers", "business activities",
+
+          ]
+
+          dilution_terms = [
+
+              "at-the-market offering",
+
+              "at the market offering",
+
+              "equity line of credit",
+
+              "registered direct offering",
+
+              "convertible notes",
+
+              "convertible securities",
+
+              "warrants outstanding",
+
+              "warrant exercise",
+
+              "shares of common stock offered",
+
+              "sales agreement",
+
+              "shelf registration",
+
+              "securities purchase agreement",
+
+              "private placement",
+
+          ]
+
+          offering_forms = {
+
+              "S-1", "S-3", "S-1/A", "S-3/A",
+
+              "424B3", "424B5", "424B4"
+
+          }
+
+          def inspect_sec(symbol):
+
+              result = {
+
+                  "china": "미확인",
+
+                  "dilution": "확인 불가",
+
+                  "filing": None,
+
+                  "source": None,
+
+                  "notes": []
+
+              }
+
+              cik = sec_map.get(symbol.upper())
+
+              if not cik:
+
+                  result["notes"].append("SEC 티커 매칭 없음")
+
+                  return result
+
+              try:
+
+                  time.sleep(0.15)
+
+                  submissions = get_json(
+
+                      f"https://data.sec.gov/submissions/CIK{cik}.json",
+
+                      SEC_HEADERS
+
+                  )
+
+                  recent = submissions.get("filings", {}).get(
+
+                      "recent", {}
+
+                  )
+
+                  forms = recent.get("form", [])
+
+                  accessions = recent.get("accessionNumber", [])
+
+                  documents = recent.get("primaryDocument", [])
+
+                  dates = recent.get("filingDate", [])
+
+                  records = []
+
+                  for i, form in enumerate(forms):
+
+                      if i >= len(accessions) or i >= len(documents):
+
+                          continue
+
+                      records.append({
+
+                          "form": form,
+
+                          "accession": accessions[i],
+
+                          "document": documents[i],
+
+                          "date": dates[i] if i < len(dates) else ""
+
+                      })
+
+                  annual = [
+
+                      x for x in records
+
+                      if x["form"] in {"10-K", "20-F", "40-F"}
+
+                  ]
+
+                  offering = [
+
+                      x for x in records
+
+                      if x["form"] in offering_forms
+
+                  ]
+
+                  to_check = []
+
+                  if annual:
+
+                      to_check.append(annual[0])
+
+                  if offering:
+
+                      item = offering[0]
+
+                      if item not in to_check:
+
+                          to_check.append(item)
+
+                  if not to_check:
+
+                      result["notes"].append("최근 연차/발행 공시 없음")
+
+                      return result
+
+                  china_found = False
+
+                  dilution_found = False
+
+                  for filing in to_check[:2]:
+
+                      try:
+
+                          time.sleep(0.15)
+
+                          raw = get_text(
+
+                              filing_url(
+
+                                  cik,
+
+                                  filing["accession"],
+
+                                  filing["document"]
+
+                              ),
+
+                              SEC_HEADERS
+
+                          )
+
+                          body = clean_html(raw).lower()
+
+                          if not result["filing"]:
+
+                              result["filing"] = (
+
+                                  filing["form"] + " / " + filing["date"]
+
+                              )
+
+                              result["source"] = (
+
+                                  "https://www.sec.gov/Archives/edgar/data/"
+
+                                  f"{int(cik)}/"
+
+                                  f"{filing['accession'].replace('-', '')}/"
+
+                                  f"{urllib.parse.quote(filing['document'])}"
+
+                              )
+
+                          has_china = any(t in body for t in china_terms)
+
+                          has_business_context = any(
+
+                              t in body for t in business_terms
+
+                          )
+
+                          if has_china and has_business_context:
+
+                              china_found = True
+
+                          if filing["form"] in offering_forms:
+
+                              dilution_found = True
+
+                          if any(t in body for t in dilution_terms):
+
+                              dilution_found = True
+
+                      except Exception as e:
+
+                          result["notes"].append(
+
+                              "공시 문서 조회 실패"
+
+                          )
+
+                          print(f"SEC filing error {symbol}: {e}")
+
+                  if china_found:
+
+                      result["china"] = "중국 관련 사업 단서 발견"
+
+                  else:
+
+                      result["china"] = "공시만으로 확인되지 않음"
+
+                  if dilution_found:
+
+                      result["dilution"] = "희석 관련 공시/키워드 발견"
+
+                  else:
+
+                      result["dilution"] = "조회 공시에서 주요 신호 미발견"
+
+              except Exception as e:
+
+                  result["notes"].append("SEC 조회 실패")
+
+                  print(f"SEC company lookup error {symbol}: {e}")
+
+              return result
+
+          # SEC checks are limited to the top 10 market candidates.
+
+          for c in candidates:
+
+              c["sec"] = inspect_sec(c["symbol"])
+
+          # 3. Build a concise Korean alert.
+
+          now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
           lines = [
 
@@ -244,13 +568,13 @@ jobs:
 
               f"스캔 시각(UTC): {now}",
 
-              "데이터 출처: Yahoo Finance 스크리너 (시세 지연 가능)",
+              "데이터: Yahoo Finance / SEC EDGAR",
 
-              "거래량 배수 = 현재 거래량 / 3개월 평균 일일 거래량",
+              "조건: 주가 $20 이하, 거래량 10만 주 이상, 평균 대비 2배 이상",
 
-              "주의: 이름 키워드만으로 중국 관련성이 입증되지는 않습니다.",
+              "주의: 장중 거래량은 누적 중이며 시세 지연·누락이 있을 수 있습니다.",
 
-              "희석 위험 및 실제 중국 사업 여부는 별도 확인이 필요합니다.",
+              "중국 단서는 확정 판정이 아니며, 희석 키워드도 추가 검토가 필요합니다.",
 
               ""
 
@@ -258,59 +582,57 @@ jobs:
 
           for c in candidates:
 
-              if c["name_match"]:
+              sec = c["sec"]
 
-                  tag = (
+              liquidity = (
 
-                      "이름 키워드 일치 - 중국 관련성 추가 확인 필요"
+                  "평균 거래량 낮음 주의"
 
-                  )
+                  if c["avg"] < 50000
 
-              else:
+                  else "평균 거래량 필터 통과"
 
-                  tag = (
-
-                      "중국 관련성 미확인 - 추가 조사 필요"
-
-                  )
+              )
 
               lines.append(
 
                   f'{c["symbol"]} | {c["name"]}\n'
 
-                  f'주가: ${c["price"]:.2f} | '
+                  f'주가: ${c["price"]:.2f} | 거래량: {c["volume"]:,.0f} | '
 
-                  f'현재 거래량: {c["volume"]:,.0f} | '
+                  f'3개월 평균: {c["avg"]:,.0f} | 배수: {c["ratio"]:.1f}x\n'
 
-                  f'3개월 평균 거래량: {c["avg"]:,.0f} | '
+                  f'유동성: {liquidity}\n'
 
-                  f'평균 대비 거래량: {c["ratio"]:.1f}x\n'
+                  f'중국 관련성: {sec["china"]}\n'
 
-                  f'{tag}\n'
+                  f'희석 위험: {sec["dilution"]}\n'
+
+                  f'SEC 공시: {sec["filing"] or "조회 자료 없음"}\n'
+
+                  f'{sec["source"] or ""}\n'
 
               )
 
           if not candidates:
 
-              lines.append(
+              lines.append("현재 조건을 통과한 후보가 없습니다.")
 
-                  "초기 주가 및 거래량 필터를 통과한 후보가 없습니다."
+          if sec_map_error:
 
-              )
+              lines.append("SEC 기업 목록을 가져오지 못해 일부 검증이 제한됐습니다.")
 
           message = "\n".join(lines)
 
           print(message)
 
-          # Send a notification only when candidates are found.
+          # Keep the existing behavior: notify only if candidates exist.
 
           if candidates:
 
-              request = urllib.request.Request(
+              req = urllib.request.Request(
 
-                  "https://ntfy.sh/"
-
-                  + urllib.parse.quote(topic, safe=""),
+                  "https://ntfy.sh/" + urllib.parse.quote(TOPIC, safe=""),
 
                   data=message.encode("utf-8"),
 
@@ -330,16 +652,12 @@ jobs:
 
               )
 
-              with urllib.request.urlopen(
-
-                  request, timeout=20
-
-              ) as response:
+              with urllib.request.urlopen(req, timeout=20) as response:
 
                   print("ntfy response:", response.status)
 
           else:
 
-              print("No alert sent.")
+              print("No candidates; no ntfy alert sent.")
 
           PY
