@@ -6,7 +6,7 @@ on:
 
   schedule:
 
-    - cron: "*/5 * * * *"
+    - cron: "*/15 * * * *"
 
 permissions:
 
@@ -20,19 +20,15 @@ jobs:
 
     steps:
 
-      - name: Checkout repository
+      - name: Set up Python
 
-        uses: actions/checkout@v4
+        uses: actions/setup-python@v5
 
-      - name: Check workflow setup
+        with:
 
-        run: |
+          python-version: "3.12"
 
-          echo "China small-cap watch workflow started"
-
-          date -u
-
-      - name: Send ntfy test notification
+      - name: Scan free market data
 
         env:
 
@@ -40,18 +36,240 @@ jobs:
 
         run: |
 
-          if [ -z "$NTFY_TOPIC" ]; then
+          python - <<'PY'
 
-            echo "NTFY_TOPIC secret is missing"
+          import os, json, urllib.request, urllib.parse
 
-            exit 1
+          from datetime import datetime, timezone
 
-          fi
+          topic = os.environ.get("NTFY_TOPIC", "").strip()
 
-          curl -fsS \
+          if not topic:
 
-            -H "Title: China Smallcap Watch test" \
+              raise SystemExit("NTFY_TOPIC secret is missing")
 
-            -d "GitHub Actions to ntfy connection test succeeded." \
+          headers = {"User-Agent": "Mozilla/5.0"}
 
-            "https://ntfy.sh/${NTFY_TOPIC}"
+          screeners = ["small_cap_gainers", "most_actives"]
+
+          found = {}
+
+          for screener in screeners:
+
+              params = urllib.parse.urlencode({
+
+                  "scrIds": screener,
+
+                  "count": 250,
+
+                  "start": 0,
+
+                  "formatted": "false"
+
+              })
+
+              url = (
+
+                  "https://query1.finance.yahoo.com/v1/finance/"
+
+                  "screener/predefined/saved?" + params
+
+              )
+
+              try:
+
+                  req = urllib.request.Request(url, headers=headers)
+
+                  with urllib.request.urlopen(req, timeout=20) as response:
+
+                      data = json.loads(response.read().decode("utf-8"))
+
+                  quotes = data["finance"]["result"][0]["quotes"]
+
+                  for q in quotes:
+
+                      if q.get("symbol"):
+
+                          found[q["symbol"]] = q
+
+              except Exception as e:
+
+                  print(f"{screener} data unavailable: {e}")
+
+          if not found:
+
+              raise SystemExit(
+
+                  "No market data received. No stock alert was generated."
+
+              )
+
+          china_words = [
+
+              "china", "chinese", "hong kong", "beijing", "shanghai",
+
+              "shenzhen", "nanjing", "hangzhou", "wuhan", "chengdu",
+
+              "xiamen", "tianjin", "suzhou", "guangzhou", "macau"
+
+          ]
+
+          candidates = []
+
+          for symbol, q in found.items():
+
+              name = q.get("shortName") or q.get("longName") or symbol
+
+              price = q.get("regularMarketPrice")
+
+              volume = q.get("regularMarketVolume")
+
+              avg = q.get("averageDailyVolume3Month")
+
+              cap = q.get("marketCap")
+
+              if not all(isinstance(x, (int, float)) for x in
+
+                         [price, volume, avg]) or avg <= 0:
+
+                  continue
+
+              if price <= 0 or price > 20 or volume < 100000:
+
+                  continue
+
+              ratio = volume / avg
+
+              if ratio < 2:
+
+                  continue
+
+              # Name keywords are only a preliminary clue, not proof
+
+              # of Chinese ownership or operations.
+
+              name_match = any(w in name.lower() for w in china_words)
+
+              candidates.append({
+
+                  "symbol": symbol,
+
+                  "name": name,
+
+                  "price": price,
+
+                  "volume": volume,
+
+                  "avg": avg,
+
+                  "ratio": ratio,
+
+                  "cap": cap,
+
+                  "name_match": name_match
+
+              })
+
+          candidates.sort(key=lambda x: x["ratio"], reverse=True)
+
+          # Prioritize name matches; keep other surges as leads
+
+          candidates.sort(key=lambda x: x["name_match"], reverse=True)
+
+          candidates = candidates[:10]
+
+          now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+          lines = [
+
+              "China Smallcap Watch - preliminary scan",
+
+              f"Scan time: {now}",
+
+              "Source: Yahoo Finance screener; quotes may be delayed.",
+
+              "Volume ratio compares current session volume with 3-month average daily volume.",
+
+              "China links and dilution risks are NOT verified by this scan.",
+
+              ""
+
+          ]
+
+          for c in candidates:
+
+              tag = (
+
+                  "NAME KEYWORD ONLY - verify China link"
+
+                  if c["name_match"]
+
+                  else "CHINA LINK UNVERIFIED - research lead"
+
+              )
+
+              lines.append(
+
+                  f'{c["symbol"]} | {c["name"]}\n'
+
+                  f'Price: ${c["price"]:.2f} | '
+
+                  f'Volume: {c["volume"]:,} | '
+
+                  f'3M avg: {c["avg"]:,} | '
+
+                  f'Volume/avg: {c["ratio"]:.1f}x\n'
+
+                  f'{tag}\n'
+
+              )
+
+          if not candidates:
+
+              lines.append(
+
+                  "No candidates met the initial price, volume and "
+
+                  "volume-ratio filters in the returned screener results."
+
+              )
+
+          message = "\n".join(lines)
+
+          print(message)
+
+          # Send only when candidates pass the initial filters
+
+          if candidates:
+
+              req = urllib.request.Request(
+
+                  f"https://ntfy.sh/{urllib.parse.quote(topic, safe='')}",
+
+                  data=message.encode("utf-8"),
+
+                  headers={
+
+                      "Title": "China Smallcap Watch",
+
+                      "Priority": "high",
+
+                      "Tags": "chart_with_upwards_trend",
+
+                      "Content-Type": "text/plain; charset=utf-8"
+
+                  },
+
+                  method="POST"
+
+              )
+
+              with urllib.request.urlopen(req, timeout=20) as response:
+
+                  print("ntfy response:", response.status)
+
+          else:
+
+              print("No alert sent.")
+
+          PY
