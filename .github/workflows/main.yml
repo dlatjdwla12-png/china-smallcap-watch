@@ -1,3 +1,5 @@
+
+
 name: China Smallcap Watch
 
 on:
@@ -50,6 +52,8 @@ jobs:
 
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
 
+          SEC_USER_EMAIL: ${{ secrets.SEC_USER_EMAIL }}
+
         run: |
 
           cat > scan.py <<'PY'
@@ -58,25 +62,17 @@ jobs:
 
           import re
 
-          import json
-
           import time
 
           import requests
 
           from datetime import datetime, timezone
 
-          SESSION = requests.Session()
-
-          SESSION.headers.update({
-
-              "User-Agent": "Mozilla/5.0 ChinaSmallcapWatch/1.0",
-
-              "Accept": "application/json,text/plain,*/*"
-
-          })
+          from urllib.parse import quote
 
           TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
+
+          SEC_EMAIL = os.environ.get("SEC_USER_EMAIL", "").strip()
 
           PRICE_MAX = 20.0
 
@@ -86,21 +82,25 @@ jobs:
 
           MAX_ALERTS = 15
 
-          def get_json(url, timeout=12):
+          SESSION = requests.Session()
+
+          SESSION.headers.update({
+
+              "User-Agent": "Mozilla/5.0 (compatible; ChinaSmallcapWatch/1.0)",
+
+              "Accept": "application/json,text/plain,*/*"
+
+          })
+
+          def get_number(value, default=0.0):
 
               try:
 
-                  r = SESSION.get(url, timeout=timeout)
+                  return float(value) if value is not None else default
 
-                  r.raise_for_status()
+              except (ValueError, TypeError):
 
-                  return r.json()
-
-              except Exception as e:
-
-                  print(f"Data request failed: {url} | {e}")
-
-                  return None
+                  return default
 
           def yahoo_screen(screen_name):
 
@@ -130,69 +130,55 @@ jobs:
 
               try:
 
-                  r = SESSION.get(url, params=params, timeout=15)
+                  response = SESSION.get(url, params=params, timeout=15)
 
-                  r.raise_for_status()
+                  response.raise_for_status()
 
-                  data = r.json()
+                  results = response.json().get("finance", {}).get("result", [])
 
-                  results = data.get("finance", {}).get("result", [])
+                  return results[0].get("quotes", []) if results else []
 
-                  if not results:
+              except Exception as exc:
 
-                      return []
-
-                  return results[0].get("quotes", []) or []
-
-              except Exception as e:
-
-                  print(f"Yahoo screener failed ({screen_name}): {e}")
+                  print(f"Yahoo screener failed ({screen_name}): {exc}")
 
                   return []
 
-          def num(value, default=0):
-
-              try:
-
-                  return float(value) if value is not None else default
-
-              except (ValueError, TypeError):
-
-                  return default
-
           def collect_candidates():
 
-              merged = {}
+              candidates = {}
 
-              for screen in ("small_cap_gainers", "most_actives"):
+              for screen_name in ("small_cap_gainers", "most_actives"):
 
-                  for q in yahoo_screen(screen):
+                  quotes = yahoo_screen(screen_name)
 
-                      ticker = str(q.get("symbol", "")).upper().strip()
+                  print(f"Yahoo screen {screen_name}: {len(quotes)} rows")
 
-                      if not ticker or not re.fullmatch(
+                  for quote_item in quotes:
 
-                          r"[A-Z][A-Z0-9.\-]{0,9}", ticker
+                      ticker = str(quote_item.get("symbol", "")).upper().strip()
 
-                      ):
+                      if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", ticker):
 
                           continue
 
-                      price = num(
+                      price = get_number(
 
-                          q.get("regularMarketPrice")
-
-                          or q.get("regularMarketPreviousClose")
+                          quote_item.get("regularMarketPrice")
 
                       )
 
-                      volume = num(q.get("regularMarketVolume"))
+                      volume = get_number(
 
-                      avg_volume = num(
+                          quote_item.get("regularMarketVolume")
 
-                          q.get("averageDailyVolume3Month")
+                      )
 
-                          or q.get("averageDailyVolume10Day")
+                      average_volume = get_number(
+
+                          quote_item.get("averageDailyVolume3Month")
+
+                          or quote_item.get("averageDailyVolume10Day")
 
                       )
 
@@ -200,23 +186,23 @@ jobs:
 
                           continue
 
-                      if volume < VOLUME_MIN:
+                      if volume < VOLUME_MIN or average_volume <= 0:
 
                           continue
 
-                      multiple = volume / avg_volume if avg_volume > 0 else 0
+                      multiple = volume / average_volume
 
                       if multiple < VOLUME_MULTIPLE_MIN:
 
                           continue
 
-                      item = merged.setdefault(ticker, {
+                      item = candidates.setdefault(ticker, {
 
                           "ticker": ticker,
 
-                          "name": q.get("shortName")
+                          "name": quote_item.get("shortName")
 
-                                  or q.get("longName")
+                                  or quote_item.get("longName")
 
                                   or ticker,
 
@@ -224,33 +210,39 @@ jobs:
 
                           "volume": int(volume),
 
-                          "avg_volume": int(avg_volume),
+                          "average_volume": int(average_volume),
 
                           "multiple": multiple,
 
-                          "change": num(q.get("regularMarketChangePercent")),
+                          "change": get_number(
 
-                          "market_cap": num(q.get("marketCap")),
+                              quote_item.get("regularMarketChangePercent")
 
-                          "screens": set()
+                          )
 
                       })
 
-                      item["screens"].add(screen)
-
                       if multiple > item["multiple"]:
 
-                          item["multiple"] = multiple
+                          item["price"] = price
 
                           item["volume"] = int(volume)
 
-                          item["avg_volume"] = int(avg_volume)
+                          item["average_volume"] = int(average_volume)
+
+                          item["multiple"] = multiple
+
+                          item["change"] = get_number(
+
+                              quote_item.get("regularMarketChangePercent")
+
+                          )
 
               return sorted(
 
-                  merged.values(),
+                  candidates.values(),
 
-                  key=lambda x: x["multiple"],
+                  key=lambda item: item["multiple"],
 
                   reverse=True
 
@@ -270,39 +262,49 @@ jobs:
 
                   try:
 
-                      r = SESSION.get(url, timeout=15)
+                      response = SESSION.get(url, timeout=15)
 
-                      r.raise_for_status()
+                      response.raise_for_status()
 
-                      data = r.json()
+                      data = response.json()
 
                       mapping = {}
 
                       if isinstance(data, dict):
 
-                          for value in data.values():
+                          for key, value in data.items():
 
                               if isinstance(value, dict):
 
                                   ticker = str(
 
-                                      value.get("ticker", "")
+                                      value.get("ticker", key)
 
-                                  ).upper()
+                                  ).upper().strip()
 
-                                  cik = value.get("cik_str")
+                                  cik = value.get("cik_str") or value.get("cik")
 
-                                  if ticker and cik:
+                              else:
 
-                                      mapping[ticker] = str(cik).zfill(10)
+                                  ticker = str(key).upper().strip()
 
-                          if not mapping:
+                                  cik = value
 
-                              for ticker, cik in data.items():
+                              if cik is None:
 
-                                  if isinstance(cik, (int, str)):
+                                  continue
 
-                                      mapping[str(ticker).upper()] = str(cik).zfill(10)
+                              cik_text = str(cik).strip()
+
+                              match = re.search(r"\d+", cik_text)
+
+                              if not match:
+
+                                  continue
+
+                              if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", ticker):
+
+                                  mapping[ticker] = match.group(0).zfill(10)
 
                       if mapping:
 
@@ -312,39 +314,95 @@ jobs:
 
                           return mapping
 
-                  except Exception as e:
+                  except Exception as exc:
 
-                      print(f"Ticker mapping unavailable: {e}")
+                      print(f"Ticker mapping unavailable: {exc}")
+
+              print("No ticker-CIK mapping source worked.")
 
               return {}
 
           CHINA_TERMS = [
 
-              "china", "chinese", "hong kong", "beijing", "shanghai",
+              "china",
 
-              "shenzhen", "guangzhou", "prc", "people's republic of china",
+              "chinese",
 
-              "variable interest entity", "v.i.e."
+              "hong kong",
+
+              "beijing",
+
+              "shanghai",
+
+              "shenzhen",
+
+              "guangzhou",
+
+              "people's republic of china",
+
+              "variable interest entity",
+
+              "v.i.e."
 
           ]
 
           DILUTION_TERMS = [
 
-              "at-the-market", "at the market offering", "equity distribution",
+              "at-the-market",
 
-              "sales agreement", "shelf registration", "registered direct offering",
+              "at the market offering",
 
-              "public offering", "private placement", "convertible note",
+              "equity distribution agreement",
 
-              "convertible debenture", "warrant", "exercise price",
+              "sales agreement",
 
-              "reverse stock split", "dilutive", "dilution",
+              "shelf registration",
 
-              "securities purchase agreement", "424b5", "s-1", "s-3",
+              "registered direct offering",
 
-              "prospectus supplement", "equity line of credit"
+              "public offering",
+
+              "private placement",
+
+              "convertible note",
+
+              "convertible debenture",
+
+              "warrant",
+
+              "exercise price",
+
+              "reverse stock split",
+
+              "dilutive",
+
+              "dilution",
+
+              "securities purchase agreement",
+
+              "prospectus supplement",
+
+              "equity line of credit",
+
+              "424b5"
 
           ]
+
+          def sec_headers():
+
+              # SEC asks automated clients to identify themselves.
+
+              contact = SEC_EMAIL or "contact@example.com"
+
+              return {
+
+                  "User-Agent": f"ChinaSmallcapWatch/1.0 ({contact})",
+
+                  "Accept-Encoding": "gzip, deflate",
+
+                  "Host": "data.sec.gov"
+
+              }
 
           def sec_check(ticker, mapping):
 
@@ -354,9 +412,9 @@ jobs:
 
                   "dilution": "확인 불가",
 
-                  "source": None,
+                  "status": "공시 조회 실패",
 
-                  "status": "공시 조회 실패"
+                  "url": f"https://www.sec.gov/edgar/search/#/q={quote(ticker)}"
 
               }
 
@@ -368,51 +426,79 @@ jobs:
 
                   return result
 
-              # SEC submissions may return 403 in hosted runners.
+              submissions_url = (
 
-              url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+                  f"https://data.sec.gov/submissions/CIK{cik}.json"
+
+              )
 
               try:
 
-                  r = SESSION.get(
+                  response = SESSION.get(
 
-                      url,
+                      submissions_url,
 
-                      headers={
-
-                          "User-Agent": "Research contact research@example.com",
-
-                          "Accept-Encoding": "gzip, deflate",
-
-                          "Host": "data.sec.gov"
-
-                      },
+                      headers=sec_headers(),
 
                       timeout=12
 
                   )
 
-                  if r.status_code == 403:
+                  if response.status_code == 403:
 
                       result["status"] = "SEC 403 접근 차단"
 
                       return result
 
-                  r.raise_for_status()
+                  response.raise_for_status()
 
-                  data = r.json()
+                  company_data = response.json()
 
-                  recent = data.get("filings", {}).get("recent", {})
+                  recent = company_data.get("filings", {}).get("recent", {})
 
                   forms = recent.get("form", [])
 
-                  dates = recent.get("filingDate", [])
-
-                  docs = recent.get("primaryDocument", [])
+                  documents = recent.get("primaryDocument", [])
 
                   accessions = recent.get("accessionNumber", [])
 
-                  company = data.get("name", ticker)
+                  dates = recent.get("filingDate", [])
+
+                  matched = []
+
+                  allowed_forms = {
+
+                      "10-K", "10-Q", "8-K", "S-1", "S-3",
+
+                      "424B3", "424B5", "6-K", "20-F", "F-1", "F-3"
+
+                  }
+
+                  for index, form in enumerate(forms):
+
+                      if form not in allowed_forms:
+
+                          continue
+
+                      if index >= len(documents) or index >= len(accessions):
+
+                          continue
+
+                      matched.append({
+
+                          "form": form,
+
+                          "document": documents[index],
+
+                          "accession": accessions[index],
+
+                          "date": dates[index] if index < len(dates) else ""
+
+                      })
+
+                      if len(matched) >= 3:
+
+                          break
 
                   china_hits = set()
 
@@ -420,29 +506,15 @@ jobs:
 
                   checked = 0
 
-                  for i, form in enumerate(forms):
+                  for filing in matched:
 
-                      if i >= len(dates) or i >= len(docs) or i >= len(accessions):
+                      accession = filing["accession"].replace("-", "")
 
-                          continue
-
-                      if form not in {
-
-                          "10-K", "10-Q", "8-K", "S-1", "S-3",
-
-                          "424B3", "424B5", "6-K", "20-F", "F-1", "F-3"
-
-                      }:
-
-                          continue
-
-                      accession = accessions[i].replace("-", "")
-
-                      document = docs[i]
+                      document = filing["document"]
 
                       filing_url = (
 
-                          f"https://www.sec.gov/Archives/edgar/data/"
+                          "https://www.sec.gov/Archives/edgar/data/"
 
                           f"{int(cik)}/{accession}/{document}"
 
@@ -450,23 +522,39 @@ jobs:
 
                       try:
 
-                          fr = SESSION.get(filing_url, timeout=10)
+                          filing_response = SESSION.get(
 
-                          if fr.status_code != 200:
+                              filing_url,
+
+                              headers=sec_headers(),
+
+                              timeout=12
+
+                          )
+
+                          if filing_response.status_code == 403:
 
                               continue
+
+                          filing_response.raise_for_status()
+
+                          body = filing_response.text.lower()
 
                           body = re.sub(
 
                               r"<script\b[^>]*>.*?</script>",
 
-                              " ", fr.text, flags=re.I | re.S
+                              " ",
+
+                              body,
+
+                              flags=re.I | re.S
 
                           )
 
                           body = re.sub(r"<[^>]+>", " ", body)
 
-                          body = re.sub(r"\s+", " ", body).lower()
+                          body = re.sub(r"\s+", " ", body)
 
                           checked += 1
 
@@ -482,75 +570,91 @@ jobs:
 
                                   dilution_hits.add(term)
 
-                          if checked >= 3:
+                          time.sleep(0.2)
 
-                              break
+                      except Exception as exc:
 
-                          time.sleep(0.15)
+                          print(
 
-                      except Exception:
+                              f"Filing download failed for {ticker}: {exc}"
 
-                          continue
+                          )
 
-                  if checked:
+                  result["url"] = (
 
-                      result["status"] = f"공시 {checked}건 확인"
+                      f"https://www.sec.gov/edgar/browse/?CIK={cik}"
 
-                      result["source"] = (
+                  )
 
-                          f"https://www.sec.gov/edgar/search/"
+                  if checked == 0:
 
-                          f"#/entityName={cik}"
+                      result["status"] = "공시 본문 확인 실패"
 
-                      )
+                      return result
+
+                  result["status"] = f"공시 본문 {checked}건 검색"
+
+                  if china_hits:
 
                       result["china"] = (
 
-                          "중국 관련 키워드 발견: "
+                          "중국 관련 키워드 발견(추가 검증 필요): "
 
                           + ", ".join(sorted(china_hits)[:5])
-
-                          if china_hits else
-
-                          "최근 확인 공시에서 관련 키워드 미발견"
-
-                      )
-
-                      result["dilution"] = (
-
-                          "희석 관련 키워드 발견: "
-
-                          + ", ".join(sorted(dilution_hits)[:6])
-
-                          if dilution_hits else
-
-                          "최근 확인 공시에서 관련 키워드 미발견"
 
                       )
 
                   else:
 
-                      result["status"] = "공시 본문 확인 실패"
+                      result["china"] = (
 
-              except Exception as e:
+                          "검색한 공시에서 관련 키워드 미발견"
 
-                  print(f"SEC check failed for {ticker}: {e}")
+                      )
+
+                  if dilution_hits:
+
+                      result["dilution"] = (
+
+                          "희석 관련 키워드 발견(추가 검증 필요): "
+
+                          + ", ".join(sorted(dilution_hits)[:6])
+
+                      )
+
+                  else:
+
+                      result["dilution"] = (
+
+                          "검색한 공시에서 관련 키워드 미발견"
+
+                      )
+
+                  return result
+
+              except Exception as exc:
+
+                  print(f"SEC submissions failed for {ticker}: {exc}")
 
                   result["status"] = "SEC 조회 오류"
 
-              return result
+                  return result
 
           def send_ntfy(message):
 
               if not TOPIC:
 
-                  print("NTFY_TOPIC secret is missing; notification skipped.")
+                  print("ERROR: NTFY_TOPIC secret is missing.")
 
                   return False
 
+              # Keep all HTTP header values ASCII-safe.
+
+              # Korean alert content is sent in the UTF-8 request body.
+
               try:
 
-                  r = requests.post(
+                  response = requests.post(
 
                       f"https://ntfy.sh/{TOPIC}",
 
@@ -558,11 +662,13 @@ jobs:
 
                       headers={
 
-                          "Title": "중국계 미국 소형주 조기 감시",
+                          "Title": "China Smallcap Watch",
 
                           "Priority": "high",
 
-                          "Tags": "chart_with_upwards_trend,mag"
+                          "Tags": "chart_with_upwards_trend,mag",
+
+                          "Content-Type": "text/plain; charset=utf-8"
 
                       },
 
@@ -570,23 +676,29 @@ jobs:
 
                   )
 
-                  print(f"ntfy response: {r.status_code}")
+                  print(f"ntfy response: {response.status_code}")
 
-                  r.raise_for_status()
+                  response.raise_for_status()
+
+                  print("Notification sent successfully.")
 
                   return True
 
-              except Exception as e:
+              except Exception as exc:
 
-                  print(f"ntfy send failed: {e}")
+                  print(f"ntfy send failed: {exc}")
 
                   return False
 
           def main():
 
-              now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+              started = datetime.now(timezone.utc).strftime(
 
-              print(f"Scan started: {now}")
+                  "%Y-%m-%d %H:%M UTC"
+
+              )
+
+              print(f"Scan started: {started}")
 
               candidates = collect_candidates()
 
@@ -594,7 +706,9 @@ jobs:
 
               if not candidates:
 
-                  print("No candidates met market filters.")
+                  print("No candidates met the market filters.")
+
+                  print("No notification sent because there are no candidates.")
 
                   return
 
@@ -602,13 +716,25 @@ jobs:
 
               lines = [
 
-                  f"미국 소형주 거래량 급증 감시",
+                  "미국 소형주 거래량 급증 감시",
 
-                  f"스캔 시각: {now}",
+                  f"스캔 시각: {started}",
 
-                  f"조건: 주가 ${PRICE_MAX:g} 이하, 거래량 {VOLUME_MIN:,} 이상, 평균 대비 {VOLUME_MULTIPLE_MIN:g}배 이상",
+                  (
 
-                  "주의: 중국 관련성 및 희석 키워드는 투자 판단의 확정 증거가 아닙니다.",
+                      f"조건: 주가 ${PRICE_MAX:g} 이하, "
+
+                      f"거래량 {VOLUME_MIN:,} 이상, "
+
+                      f"평균 거래량 대비 {VOLUME_MULTIPLE_MIN:g}배 이상"
+
+                  ),
+
+                  "",
+
+                  "주의: 키워드 발견은 중국계 여부 또는 실제 희석의 확정 증거가 아닙니다.",
+
+                  "공시 접근 실패 시 확인 불가로 표시합니다.",
 
                   ""
 
@@ -620,23 +746,35 @@ jobs:
 
                   sec = sec_check(ticker, mapping)
 
-                  change = item["change"]
-
                   lines.extend([
 
                       f"[{ticker}] {item['name']}",
 
-                      f"현재가: ${item['price']:.2f} | 등락률: {change:+.1f}%",
+                      (
 
-                      f"거래량: {item['volume']:,} | 평균 대비: {item['multiple']:.1f}배",
+                          f"현재가: ${item['price']:.2f} | "
+
+                          f"등락률: {item['change']:+.1f}%"
+
+                      ),
+
+                      (
+
+                          f"거래량: {item['volume']:,} | "
+
+                          f"평균 거래량: {item['average_volume']:,} | "
+
+                          f"평균 대비: {item['multiple']:.1f}배"
+
+                      ),
 
                       f"중국 관련성: {sec['china']}",
 
                       f"희석 위험 단서: {sec['dilution']}",
 
-                      f"공시 조회 상태: {sec['status']}",
+                      f"공시 상태: {sec['status']}",
 
-                      f"공시 확인: {sec['source'] or 'https://www.sec.gov/edgar/search/'}",
+                      f"SEC 공시: {sec['url']}",
 
                       f"Yahoo Finance: https://finance.yahoo.com/quote/{ticker}/",
 
@@ -644,9 +782,23 @@ jobs:
 
                   ])
 
-                  time.sleep(0.15)
+                  print(
 
-              send_ntfy("\n".join(lines))
+                      f"{ticker}: volume multiple={item['multiple']:.2f}; "
+
+                      f"SEC={sec['status']}"
+
+                  )
+
+              sent = send_ntfy("\n".join(lines))
+
+              if not sent:
+
+                  raise RuntimeError(
+
+                      "Notification failed. Check NTFY_TOPIC and ntfy logs."
+
+                  )
 
           if __name__ == "__main__":
 
