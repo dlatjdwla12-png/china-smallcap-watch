@@ -26,7 +26,7 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    timeout-minutes: 8
+    timeout-minutes: 12
 
     steps:
 
@@ -86,7 +86,7 @@ jobs:
 
           SESSION.headers.update({
 
-              "User-Agent": "Mozilla/5.0 (compatible; ChinaSmallcapWatch/1.1)",
+              "User-Agent": "Mozilla/5.0 (compatible; ChinaSmallcapWatch/1.2)",
 
               "Accept": "application/json,text/plain,*/*"
 
@@ -188,53 +188,27 @@ jobs:
 
                           continue
 
-                      if ticker not in candidates:
+                      item = {
 
-                          candidates[ticker] = {
+                          "ticker": ticker,
 
-                              "ticker": ticker,
+                          "name": q.get("shortName") or q.get("longName") or ticker,
 
-                              "name": q.get("shortName")
+                          "price": price,
 
-                                      or q.get("longName")
+                          "volume": int(volume),
 
-                                      or ticker,
+                          "average_volume": int(avg_volume),
 
-                              "price": price,
+                          "multiple": multiple,
 
-                              "volume": int(volume),
+                          "change": get_number(q.get("regularMarketChangePercent"))
 
-                              "average_volume": int(avg_volume),
+                      }
 
-                              "multiple": multiple,
+                      if ticker not in candidates or multiple > candidates[ticker]["multiple"]:
 
-                              "change": get_number(
-
-                                  q.get("regularMarketChangePercent")
-
-                              )
-
-                          }
-
-                      elif multiple > candidates[ticker]["multiple"]:
-
-                          candidates[ticker].update({
-
-                              "price": price,
-
-                              "volume": int(volume),
-
-                              "average_volume": int(avg_volume),
-
-                              "multiple": multiple,
-
-                              "change": get_number(
-
-                                  q.get("regularMarketChangePercent")
-
-                              )
-
-                          })
+                          candidates[ticker] = item
 
               return sorted(
 
@@ -260,25 +234,17 @@ jobs:
 
                   try:
 
-                      # Do not force a Host header. Each URL must use its
-
-                      # own correct host.
-
                       headers = {}
 
                       if SEC_EMAIL:
 
                           headers["User-Agent"] = (
 
-                              f"ChinaSmallcapWatch/1.1 ({SEC_EMAIL})"
+                              f"ChinaSmallcapWatch/1.2 ({SEC_EMAIL})"
 
                           )
 
-                      response = SESSION.get(
-
-                          url, headers=headers, timeout=15
-
-                      )
+                      response = SESSION.get(url, headers=headers, timeout=15)
 
                       response.raise_for_status()
 
@@ -292,19 +258,9 @@ jobs:
 
                               if isinstance(value, dict):
 
-                                  ticker = str(
+                                  ticker = str(value.get("ticker", key)).upper().strip()
 
-                                      value.get("ticker", key)
-
-                                  ).upper().strip()
-
-                                  cik = (
-
-                                      value.get("cik_str")
-
-                                      or value.get("cik")
-
-                                  )
+                                  cik = value.get("cik_str") or value.get("cik")
 
                               else:
 
@@ -322,21 +278,13 @@ jobs:
 
                                   continue
 
-                              if re.fullmatch(
-
-                                  r"[A-Z][A-Z0-9.\-]{0,9}", ticker
-
-                              ):
+                              if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", ticker):
 
                                   mapping[ticker] = match.group(0).zfill(10)
 
                       if mapping:
 
-                          print(
-
-                              f"Ticker-CIK mapping loaded: {len(mapping)}"
-
-                          )
+                          print(f"Ticker-CIK mapping loaded: {len(mapping)}")
 
                           print(f"Mapping source: {url}")
 
@@ -352,93 +300,45 @@ jobs:
 
           CHINA_TERMS = [
 
-              "china",
+              "china", "chinese", "hong kong", "beijing", "shanghai",
 
-              "chinese",
+              "shenzhen", "guangzhou", "people's republic of china",
 
-              "hong kong",
+              "variable interest entity", "v.i.e.", "mainland china",
 
-              "beijing",
-
-              "shanghai",
-
-              "shenzhen",
-
-              "guangzhou",
-
-              "people's republic of china",
-
-              "variable interest entity",
-
-              "v.i.e.",
-
-              "mainland china",
-
-              "based in china",
-
-              "incorporated in the cayman islands"
+              "based in china"
 
           ]
 
           DILUTION_TERMS = [
 
-              "at-the-market",
+              "at-the-market", "at the market offering",
 
-              "at the market offering",
+              "equity distribution agreement", "sales agreement",
 
-              "equity distribution agreement",
+              "shelf registration", "registered direct offering",
 
-              "sales agreement",
+              "public offering", "private placement", "convertible note",
 
-              "shelf registration",
+              "convertible debenture", "warrant", "exercise price",
 
-              "registered direct offering",
+              "reverse stock split", "dilutive", "dilution",
 
-              "public offering",
+              "securities purchase agreement", "prospectus supplement",
 
-              "private placement",
+              "equity line of credit", "424b5", "424b3",
 
-              "convertible note",
-
-              "convertible debenture",
-
-              "warrant",
-
-              "exercise price",
-
-              "reverse stock split",
-
-              "dilutive",
-
-              "dilution",
-
-              "securities purchase agreement",
-
-              "prospectus supplement",
-
-              "equity line of credit",
-
-              "424b5",
-
-              "424b3",
-
-              "form s-1",
-
-              "form s-3",
-
-              "common stock offering"
+              "form s-1", "form s-3", "common stock offering"
 
           ]
 
           def sec_request_headers():
 
-              # Never hard-code Host: the destination host must match the URL.
-
               contact = SEC_EMAIL or "contact@example.com"
 
               return {
 
-                  "User-Agent": f"ChinaSmallcapWatch/1.1 ({contact})",
+                  "User-Agent": f"ChinaSmallcapWatch/1.2 ({contact})",
 
                   "Accept-Encoding": "gzip, deflate",
 
@@ -447,6 +347,8 @@ jobs:
               }
 
           def fetch_filing_text(cik, accession, primary_document):
+
+              # SEC archive URLs use the numeric CIK and accession without dashes.
 
               cik_path = str(int(cik))
 
@@ -460,45 +362,67 @@ jobs:
 
               )
 
-              # Try the exact primary document first, then the full submission.
-
-              urls = []
+              candidates = []
 
               if primary_document:
 
-                  urls.append(base + primary_document.lstrip("/"))
+                  document = primary_document.lstrip("/")
 
-              urls.append(base + accession_compact + ".txt")
+                  candidates.append((base + document, "primary document"))
 
-              for url in urls:
+              candidates.append((
+
+                  base + accession_compact + ".txt",
+
+                  "complete submission text"
+
+              ))
+
+              # Filing index pages are beside the accession directory.
+
+              index_base = (
+
+                  "https://www.sec.gov/Archives/edgar/data/"
+
+                  f"{cik_path}/{accession}-index"
+
+              )
+
+              candidates.extend([
+
+                  (index_base + ".htm", "filing index"),
+
+                  (index_base + ".html", "alternate filing index")
+
+              ])
+
+              tried = set()
+
+              for url, label in candidates:
+
+                  if url in tried:
+
+                      continue
+
+                  tried.add(url)
 
                   try:
 
                       response = SESSION.get(
 
-                          url,
-
-                          headers=sec_request_headers(),
-
-                          timeout=12
+                          url, headers=sec_request_headers(), timeout=12
 
                       )
 
                       if response.status_code == 403:
 
-                          print("SEC filing access denied (403).")
+                          print(f"SEC {label} blocked (403): {url}")
 
                           continue
 
                       if response.status_code == 404:
 
-                          print(
-
-                              f"SEC document not found (404): "
-
-                              f"{primary_document or accession_compact}"
-
-                          )
+                          print(f"SEC {label} not found (404): {url}")
 
                           continue
 
@@ -506,11 +430,101 @@ jobs:
 
                       if response.text.strip():
 
+                          print(f"SEC download succeeded ({label}): {url}")
+
                           return response.text, url
 
                   except Exception as exc:
 
-                      print(f"SEC filing request failed: {exc}")
+                      print(f"SEC {label} request failed: {exc}")
+
+              # Final fallback: ask SEC for the directory's actual file list.
+
+              manifest_url = base + "index.json"
+
+              try:
+
+                  response = SESSION.get(
+
+                      manifest_url, headers=sec_request_headers(), timeout=12
+
+                  )
+
+                  if response.ok:
+
+                      manifest = response.json()
+
+                      items = manifest.get("directory", {}).get("item", [])
+
+                      names = [
+
+                          str(item.get("name", ""))
+
+                          for item in items if isinstance(item, dict)
+
+                      ]
+
+                      wanted = (
+
+                          primary_document.rsplit("/", 1)[-1]
+
+                          if primary_document else ""
+
+                      )
+
+                      matches = [wanted] if wanted and wanted in names else []
+
+                      matches.extend(
+
+                          name for name in names
+
+                          if name.lower().endswith(".txt") and name not in matches
+
+                      )
+
+                      for name in matches[:3]:
+
+                          url = base + name
+
+                          try:
+
+                              doc = SESSION.get(
+
+                                  url, headers=sec_request_headers(), timeout=12
+
+                              )
+
+                              if doc.ok and doc.text.strip():
+
+                                  print(f"SEC manifest fallback succeeded: {url}")
+
+                                  return doc.text, url
+
+                              print(
+
+                                  f"SEC manifest file unavailable "
+
+                                  f"({doc.status_code}): {url}"
+
+                              )
+
+                          except Exception as exc:
+
+                              print(f"SEC manifest file request failed: {exc}")
+
+                  else:
+
+                      print(
+
+                          f"SEC manifest unavailable ({response.status_code}): "
+
+                          f"{manifest_url}"
+
+                      )
+
+              except Exception as exc:
+
+                  print(f"SEC manifest request failed: {exc}")
 
               return None, None
 
@@ -524,13 +538,7 @@ jobs:
 
                   "status": "공시 조회 실패",
 
-                  "url": (
-
-                      "https://www.sec.gov/edgar/search/"
-
-                      f"#/q={quote(ticker)}"
-
-                  )
+                  "url": f"https://www.sec.gov/edgar/search/#/q={quote(ticker)}"
 
               }
 
@@ -542,11 +550,7 @@ jobs:
 
                   return result
 
-              submissions_url = (
-
-                  f"https://data.sec.gov/submissions/CIK{cik}.json"
-
-              )
+              submissions_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
 
               try:
 
@@ -570,11 +574,7 @@ jobs:
 
                   company_data = response.json()
 
-                  result["url"] = (
-
-                      f"https://www.sec.gov/edgar/browse/?CIK={cik}"
-
-                  )
+                  result["url"] = f"https://www.sec.gov/edgar/browse/?CIK={cik}"
 
                   recent = company_data.get("filings", {}).get("recent", {})
 
@@ -632,11 +632,7 @@ jobs:
 
                       body, source_url = fetch_filing_text(
 
-                          cik,
-
-                          filing["accession"],
-
-                          filing["document"]
+                          cik, filing["accession"], filing["document"]
 
                       )
 
@@ -644,17 +640,11 @@ jobs:
 
                           continue
 
-                      # Remove script/style and markup before keyword scanning.
-
                       body = re.sub(
 
                           r"<(script|style)\b[^>]*>.*?</\1>",
 
-                          " ",
-
-                          body,
-
-                          flags=re.I | re.S
+                          " ", body, flags=re.I | re.S
 
                       )
 
@@ -678,7 +668,7 @@ jobs:
 
                       print(
 
-                          f"{ticker}: read filing {filing['form']} "
+                          f"{ticker}: read {filing['form']} "
 
                           f"{filing['date']} from {source_url}"
 
@@ -706,11 +696,7 @@ jobs:
 
                   else:
 
-                      result["china"] = (
-
-                          "검색한 공시에서 관련 키워드 미발견"
-
-                      )
+                      result["china"] = "검색한 공시에서 관련 키워드 미발견"
 
                   if dilution_hits:
 
@@ -724,11 +710,7 @@ jobs:
 
                   else:
 
-                      result["dilution"] = (
-
-                          "검색한 공시에서 관련 키워드 미발견"
-
-                      )
+                      result["dilution"] = "검색한 공시에서 관련 키워드 미발견"
 
                   return result
 
@@ -788,11 +770,7 @@ jobs:
 
           def main():
 
-              started = datetime.now(timezone.utc).strftime(
-
-                  "%Y-%m-%d %H:%M UTC"
-
-              )
+              started = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
               print(f"Scan started: {started}")
 
@@ -828,7 +806,7 @@ jobs:
 
                   "",
 
-                  "주의: 키워드 발견은 중국계 여부 또는 실제 희석의 확정 증거가 아닙니다.",
+                  "주의: 키워드는 중국계 여부 또는 실제 희석의 확정 증거가 아닙니다.",
 
                   "공시 접근 실패 시 확인 불가로 표시합니다.",
 
@@ -846,13 +824,7 @@ jobs:
 
                       f"[{ticker}] {item['name']}",
 
-                      (
-
-                          f"현재가: ${item['price']:.2f} | "
-
-                          f"등락률: {item['change']:+.1f}%"
-
-                      ),
+                      f"현재가: ${item['price']:.2f} | 등락률: {item['change']:+.1f}%",
 
                       (
 
@@ -872,13 +844,7 @@ jobs:
 
                       f"SEC 공시: {sec['url']}",
 
-                      (
-
-                          "Yahoo Finance: "
-
-                          f"https://finance.yahoo.com/quote/{ticker}/"
-
-                      ),
+                      f"Yahoo Finance: https://finance.yahoo.com/quote/{ticker}/",
 
                       ""
 
