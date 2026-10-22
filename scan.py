@@ -1,12 +1,20 @@
+
+
 import os
 
 import re
 
 import json
 
-import requests
+import time
+
+import random
 
 from datetime import datetime, timezone
+
+import requests
+
+# ===== 기본 설정 =====
 
 PRICE_MAX = 20.0
 
@@ -14,19 +22,25 @@ VOLUME_MIN = 100_000
 
 VOLUME_MULTIPLE_MIN = 2.0
 
-MAX_ALERTS = 10
+DOLLAR_VOLUME_MIN = 1_000_000
+
+MAX_ALERTS = 15
 
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "").strip()
 
-SEC_USER_EMAIL = os.getenv("SEC_USER_EMAIL", "scanner@example.com")
+SEC_USER_EMAIL = os.getenv("SEC_USER_EMAIL", "").strip()
+
+YAHOO_URL = "https://query1.finance.yahoo.com/v1/finance/screener"
 
 CHINA_TERMS = [
 
-    "china", "chinese", "hong kong", "beijing", "shanghai",
+    "china", "chinese", "hong kong", "macau", "macao",
 
-    "shenzhen", "guangzhou", "macau", "macao",
+    "beijing", "shanghai", "shenzhen", "guangzhou",
 
-    "people's republic of china", "variable interest entity", "v.i.e."
+    "people's republic of china", "variable interest entity",
+
+    "v.i.e.", "cayman", "hongkong"
 
 ]
 
@@ -34,221 +48,207 @@ DILUTION_TERMS = [
 
     "at-the-market", "at the market offering",
 
-    "equity distribution agreement", "shelf registration",
+    "equity distribution agreement", "sales agreement",
+
+    "shelf registration", "s-1", "s-3", "424b5",
 
     "registered direct offering", "public offering",
 
     "private placement", "convertible note",
 
-    "convertible debenture", "warrant", "reverse stock split",
+    "convertible debenture", "warrant",
 
-    "dilution", "securities purchase agreement",
+    "reverse stock split", "dilutive", "dilution",
 
-    "prospectus supplement", "equity line of credit", "424b5"
+    "securities purchase agreement", "prospectus supplement",
+
+    "equity line of credit"
 
 ]
 
-HEADERS = {
+session = requests.Session()
 
-    "User-Agent": f"ChinaSmallcapWatch {SEC_USER_EMAIL}",
+session.headers.update({
 
-    "Accept": "application/json"
+    "User-Agent": "Mozilla/5.0 (compatible; SmallcapResearch/1.0)",
 
-}
+    "Accept": "application/json,text/plain,*/*",
 
-def get_json(url, headers=None, params=None):
+    "Accept-Language": "en-US,en;q=0.9",
 
-    try:
+})
 
-        response = requests.get(
+def get_json(url, params=None, attempts=3):
 
-            url, headers=headers or {}, params=params, timeout=20
+    """429 등 일시적인 오류는 대기 후 재시도한다."""
 
-        )
-
-        response.raise_for_status()
-
-        return response.json()
-
-    except Exception as exc:
-
-        print(f"Request failed: {url} - {exc}")
-
-        return None
-
-def get_candidates():
-
-    found = {}
-
-    url = "https://query1.finance.yahoo.com/v1/finance/screener"
-
-    for screen in ["small_cap_gainers", "most_actives"]:
-
-        params = {
-
-            "scrIds": screen,
-
-            "count": 100,
-
-            "start": 0,
-
-            "formatted": "false"
-
-        }
-
-        data = get_json(url, params=params)
-
-        if not data:
-
-            continue
+    for attempt in range(attempts):
 
         try:
 
-            quotes = data["finance"]["result"][0]["quotes"]
+            response = session.get(
 
-            for item in quotes:
+                url, params=params, timeout=20
 
-                symbol = item.get("symbol", "")
+            )
 
-                if symbol:
+            if response.status_code == 429:
 
-                    found[symbol] = item
+                wait = min(60, 10 * (attempt + 1))
 
-        except (KeyError, IndexError, TypeError):
+                print(f"요청 제한(429). {wait}초 대기")
 
-            print(f"Unexpected Yahoo response for {screen}")
+                time.sleep(wait)
 
-    return list(found.values())
+                continue
 
-def get_company_tickers():
+            response.raise_for_status()
+
+            return response.json()
+
+        except (requests.RequestException, ValueError) as exc:
+
+            print(f"요청 실패 ({attempt + 1}/{attempts}): {exc}")
+
+            if attempt < attempts - 1:
+
+                time.sleep(3 * (attempt + 1))
+
+    return None
+
+def yahoo_candidates(scr_id):
+
+    params = {
+
+        "scrIds": scr_id,
+
+        "count": 100,
+
+        "start": 0,
+
+        "formatted": "false",
+
+        "lang": "en-US",
+
+        "region": "US",
+
+    }
+
+    data = get_json(YAHOO_URL, params=params)
+
+    if not data:
+
+        return None
+
+    try:
+
+        quotes = data["finance"]["result"][0]["quotes"]
+
+        return quotes
+
+    except (KeyError, IndexError, TypeError):
+
+        print(f"Yahoo 응답 형식 확인 필요: {scr_id}")
+
+        return None
+
+def get_text(item):
+
+    fields = [
+
+        item.get("shortName"),
+
+        item.get("longName"),
+
+        item.get("displayName"),
+
+        item.get("symbol"),
+
+    ]
+
+    return " ".join(str(x) for x in fields if x).lower()
+
+def company_sec_lookup():
 
     urls = [
 
         "https://www.sec.gov/files/company_tickers.json",
 
-        "https://www.sec.gov/files/company_tickers_exchange.json"
+        "https://www.sec.gov/files/company_tickers_exchange.json",
 
     ]
 
     for url in urls:
 
-        data = get_json(url, HEADERS)
+        data = get_json(url, attempts=2)
 
-        if not data:
+        if data:
 
-            continue
+            return data
 
-        mapping = {}
+    return None
 
-        values = data.values() if isinstance(data, dict) else data
+def sec_company_text(cik):
 
-        for item in values:
+    if not cik or not SEC_USER_EMAIL:
 
-            if not isinstance(item, dict):
+        return ""
 
-                continue
+    url = (
 
-            ticker = str(item.get("ticker", "")).upper()
+        "https://data.sec.gov/submissions/"
 
-            cik = item.get("cik_str") or item.get("cik")
+        f"CIK{int(cik):010d}.json"
 
-            if ticker and cik:
+    )
 
-                mapping[ticker] = str(cik).zfill(10)
+    headers = {
 
-        if mapping:
+        "User-Agent": f"SmallcapResearch {SEC_USER_EMAIL}",
 
-            return mapping
+        "Accept-Encoding": "gzip, deflate",
 
-    return {}
-
-def get_sec_clues(ticker, cik_map):
-
-    cik = cik_map.get(ticker.upper())
-
-    if not cik:
-
-        return [], []
-
-    url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-
-    data = get_json(url, HEADERS)
-
-    if not data:
-
-        return [], []
+    }
 
     try:
 
-        recent = data["filings"]["recent"]
+        response = session.get(url, headers=headers, timeout=20)
 
-        forms = recent.get("form", [])
+        if response.status_code == 429:
 
-        dates = recent.get("filingDate", [])
+            print("SEC 요청 제한(429)")
 
-        descriptions = recent.get("primaryDocDescription", [])
+            return ""
 
-    except (KeyError, TypeError):
+        response.raise_for_status()
 
-        return [], []
+        data = response.json()
 
-    china_hits = []
+        return " ".join([
 
-    dilution_hits = []
+            str(data.get("name", "")),
 
-    cutoff = datetime.now(timezone.utc).date()
+            str(data.get("tickers", "")),
 
-    for i, form in enumerate(forms[:30]):
+            str(data.get("exchanges", "")),
 
-        date_text = dates[i] if i < len(dates) else ""
+            str(data.get("addresses", "")),
 
-        try:
+        ]).lower()
 
-            age = (cutoff - datetime.strptime(
+    except (requests.RequestException, ValueError) as exc:
 
-                date_text, "%Y-%m-%d"
+        print(f"SEC 조회 실패: {exc}")
 
-            ).date()).days
-
-        except ValueError:
-
-            age = 999
-
-        if age > 120:
-
-            continue
-
-        desc = descriptions[i] if i < len(descriptions) else ""
-
-        text = f"{form} {desc}".lower()
-
-        if form in {"S-1", "S-3", "424B3", "424B5", "F-1", "F-3", "8-K"}:
-
-            dilution_hits.append(f"{form} ({date_text})")
-
-        for term in DILUTION_TERMS:
-
-            if term in text:
-
-                dilution_hits.append(f"{term} ({date_text})")
-
-                break
-
-    # SEC filing descriptions alone do not reliably establish company origin.
-
-    # Treat China clues as unconfirmed until company facts are reviewed.
-
-    return china_hits, list(dict.fromkeys(dilution_hits))[:5]
+        return ""
 
 def send_alert(message):
 
     if not NTFY_TOPIC:
 
-        print("NTFY_TOPIC secret is missing; alert not sent.")
+        print("NTFY_TOPIC 비밀값이 설정되지 않았습니다.")
 
-        print(message)
-
-        return False
+        return
 
     url = f"https://ntfy.sh/{NTFY_TOPIC}"
 
@@ -262,67 +262,133 @@ def send_alert(message):
 
             headers={
 
-                "Title": "중국계 미국 소형주 감시",
+                "Title": "중국계 미국 소형주 감지",
 
-                "Priority": "default",
+                "Priority": "high",
 
-                "Tags": "chart_with_upwards_trend"
+                "Tags": "chart_with_upwards_trend",
 
             },
 
-            timeout=20
+            timeout=20,
 
         )
 
         response.raise_for_status()
 
-        return True
+        print("ntfy 알림 전송 성공")
 
-    except Exception as exc:
+    except requests.RequestException as exc:
 
-        print(f"ntfy send failed: {exc}")
-
-        return False
+        print(f"ntfy 전송 실패: {exc}")
 
 def main():
 
-    print("Scanner started:", datetime.now(timezone.utc).isoformat())
+    print("스캐너 시작:", datetime.now(timezone.utc).isoformat())
 
-    candidates = get_candidates()
+    all_quotes = {}
 
-    if not candidates:
+    data_errors = []
 
-        print("No candidates returned by Yahoo.")
+    # 요청을 연속해서 보내지 않고 간격을 둔다.
+
+    for scr_id in ("small_cap_gainers", "most_actives"):
+
+        quotes = yahoo_candidates(scr_id)
+
+        if quotes is None:
+
+            data_errors.append(scr_id)
+
+        else:
+
+            for item in quotes:
+
+                symbol = item.get("symbol")
+
+                if symbol:
+
+                    all_quotes[symbol] = item
+
+        time.sleep(random.uniform(4, 8))
+
+    if not all_quotes:
+
+        print(
+
+            "데이터 수집 실패: 후보가 없다고 판단하지 않습니다. "
+
+            f"실패한 목록: {data_errors}"
+
+        )
 
         return
 
-    cik_map = get_company_tickers()
+    print(f"고유 종목 수집: {len(all_quotes)}")
+
+    sec_data = company_sec_lookup()
+
+    sec_rows = []
+
+    if isinstance(sec_data, dict):
+
+        sec_rows = list(sec_data.values())
+
+    elif isinstance(sec_data, list):
+
+        sec_rows = sec_data
+
+    # 티커별 CIK 매핑
+
+    cik_by_ticker = {}
+
+    for row in sec_rows:
+
+        if not isinstance(row, dict):
+
+            continue
+
+        ticker = str(row.get("ticker", "")).upper()
+
+        cik = row.get("cik_str") or row.get("cik")
+
+        if ticker and cik:
+
+            cik_by_ticker[ticker] = cik
 
     alerts = []
 
-    for item in candidates:
+    sec_cache = {}
 
-        ticker = item.get("symbol", "")
-
-        price = item.get("regularMarketPrice")
-
-        change = item.get("regularMarketChangePercent", 0)
-
-        volume = item.get("regularMarketVolume", 0)
-
-        average = item.get("averageDailyVolume3Month", 0)
-
-        name = item.get("shortName") or item.get("longName") or ticker
+    for symbol, item in all_quotes.items():
 
         try:
 
-            price = float(price)
+            price = float(item.get("regularMarketPrice") or 0)
 
-            volume = int(volume or 0)
+            volume = int(item.get("regularMarketVolume") or 0)
 
-            average = int(average or 0)
+            avg_volume = int(
 
-            change = float(change or 0)
+                item.get("averageDailyVolume3Month") or
+
+                item.get("averageDailyVolume10Day") or 0
+
+            )
+
+            change = float(
+
+                item.get("regularMarketChangePercent") or 0
+
+            )
+
+            name = str(
+
+                item.get("longName") or
+
+                item.get("shortName") or symbol
+
+            )
 
         except (ValueError, TypeError):
 
@@ -332,57 +398,79 @@ def main():
 
             continue
 
-        if volume < VOLUME_MIN or average <= 0:
+        if volume < VOLUME_MIN or avg_volume <= 0:
 
             continue
 
-        multiple = volume / average
+        multiple = volume / avg_volume
+
+        dollar_volume = price * volume
 
         if multiple < VOLUME_MULTIPLE_MIN:
 
             continue
 
-        china_hits, dilution_hits = get_sec_clues(ticker, cik_map)
-
-        dollar_volume = price * volume
-
-        if dollar_volume < 1_000_000:
+        if dollar_volume < DOLLAR_VOLUME_MIN:
 
             continue
 
-        if multiple >= 5:
+        # 회사 이름·티커 및 SEC 제출 정보에서 중국 관련 단서 탐색
 
-            signal = "강한 거래량 급증"
+        description = get_text(item)
 
-        elif multiple >= 3:
+        cik = cik_by_ticker.get(symbol.upper())
 
-            signal = "거래량 급증"
+        if cik:
 
-        else:
+            if cik not in sec_cache:
 
-            signal = "거래량 증가"
+                sec_cache[cik] = sec_company_text(cik)
+
+                time.sleep(0.2)
+
+            description += " " + sec_cache[cik]
+
+        china_hits = [
+
+            term for term in CHINA_TERMS if term in description
+
+        ]
+
+        # 중국 관련 단서가 없는 종목은 제외한다.
+
+        if not china_hits:
+
+            continue
+
+        dilution_hits = [
+
+            term for term in DILUTION_TERMS if term in description
+
+        ]
 
         lines = [
 
-            f"[{signal}] {ticker} - {name}",
+            f"종목: {symbol} ({name})",
 
-            f"가격: ${price:.2f} / 변동률: {change:+.2f}%",
+            f"가격: ${price:.2f} / 등락률: {change:+.2f}%",
 
-            f"거래량: {volume:,} / 3개월 평균: {average:,}",
+            f"거래량: {volume:,}",
 
-            f"평균 대비 거래량: {multiple:.1f}배",
+            f"평균 거래량 대비: {multiple:.2f}배",
 
-            f"거래대금 추정: ${dollar_volume:,.0f}",
+            f"추정 거래대금: ${dollar_volume:,.0f}",
 
-            "중국계 확인: 미확인(회사 소재지 추가 검증 필요)",
+            "중국계 단서: " + ", ".join(china_hits[:5]),
 
             "희석 단서: " + (
 
-                ", ".join(dilution_hits) if dilution_hits else "최근 SEC 제출 목록에서 명확한 단서 없음"
+                ", ".join(dilution_hits[:8])
+
+                if dilution_hits else "이번 검색에서 발견 못함"
 
             ),
 
-            "주의: 자동 탐지 신호이며 매수 추천이 아닙니다."
+            "주의: 자동 탐지 신호이며 매수 추천이 아닙니다.",
 
         ]
 
@@ -392,11 +480,21 @@ def main():
 
     for _, message in alerts[:MAX_ALERTS]:
 
+        print("=" * 35)
+
         print(message)
 
         send_alert(message)
 
-    print(f"Finished. Candidates alerted: {min(len(alerts), MAX_ALERTS)}")
+        time.sleep(1)
+
+    print(
+
+        f"완료: 알림 {min(len(alerts), MAX_ALERTS)}건, "
+
+        f"수집 오류 {len(data_errors)}건"
+
+    )
 
 if __name__ == "__main__":
 
